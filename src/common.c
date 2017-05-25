@@ -298,6 +298,13 @@ sa_sin6:
 				"fi_sockaddr_in6://[%s]:%" PRIu16, str,
 				ntohs(sin6->sin6_port));
 		break;
+	case FI_ADDR_EFA:
+		memset(str, 0, sizeof(str));
+		if (!inet_ntop(AF_INET6, addr, str, INET6_ADDRSTRLEN))
+			return NULL;
+		size = snprintf(buf, *len, "fi_addr_efa://[%s]:%" PRIu16,
+				str, *((uint16_t *)addr + 8));
+		break;
 	case FI_SOCKADDR_IB:
 		size = snprintf(buf, *len, "fi_sockaddr_ib://%p", addr);
 		break;
@@ -371,6 +378,8 @@ static uint32_t ofi_addr_format(const char *str)
 		return FI_ADDR_GNI;
 	else if (!strcasecmp(fmt, "fi_addr_bgq"))
 		return FI_ADDR_BGQ;
+	else if (!strcasecmp(fmt, "fi_addr_efa"))
+		return FI_ADDR_EFA;
 	else if (!strcasecmp(fmt, "fi_addr_mlx"))
 		return FI_ADDR_MLX;
 	else if (!strcasecmp(fmt, "fi_addr_ib_ud"))
@@ -531,6 +540,32 @@ match_port:
 	return 0;
 }
 
+static int ofi_str_to_efa(const char *str, void **addr, size_t *len)
+{
+	char gid[INET6_ADDRSTRLEN];
+	uint16_t *qpn;
+	int ret;
+
+	memset(gid, 0, sizeof(gid));
+
+	*len = 18;
+	*addr = calloc(1, *len);
+	if (!*addr)
+		return -FI_ENOMEM;
+	qpn = (uint16_t *)*addr + 8;
+
+	ret = sscanf(str, "%*[^:]://[%64[^]]]:%" SCNu16, gid, qpn);
+	if (ret < 1)
+		goto err;
+
+	if (inet_pton(AF_INET6, gid, *addr) > 0)
+		return FI_SUCCESS;
+
+err:
+	free(*addr);
+	return -FI_EINVAL;
+}
+
 int ofi_str_toaddr(const char *str, uint32_t *addr_format,
 		   void **addr, size_t *len)
 {
@@ -549,6 +584,8 @@ int ofi_str_toaddr(const char *str, uint32_t *addr_format,
 		return ofi_str_to_psmx2(str, addr, len);
 	case FI_ADDR_IB_UD:
 		return ofi_str_to_ib_ud(str, addr, len);
+	case FI_ADDR_EFA:
+		return ofi_str_to_efa(str, addr, len);
 	case FI_SOCKADDR_IB:
 	case FI_ADDR_GNI:
 	case FI_ADDR_BGQ:

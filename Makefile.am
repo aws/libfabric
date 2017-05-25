@@ -1,7 +1,7 @@
 #
 # Copyright (c) 2016 Cisco Systems, Inc.  All rights reserved.
 # Copyright (c) 2017-2018 Intel Corporation, Inc. All right reserved.
-# Copyright (c) 2018 Amazon.com, Inc. or its affiliates. All rights reserved.
+# Copyright (c) 2018-2019 Amazon.com, Inc. or its affiliates. All rights reserved.
 #
 # Makefile.am for libfabric
 
@@ -375,6 +375,7 @@ EXTRA_DIST=
 include prov/sockets/Makefile.include
 include prov/udp/Makefile.include
 include prov/verbs/Makefile.include
+include prov/efa/Makefile.include
 include prov/usnic/Makefile.include
 include prov/psm/Makefile.include
 include prov/psm2/Makefile.include

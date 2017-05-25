@@ -184,6 +184,7 @@ static int str2addr_format(char *inputstr, uint32_t *value)
 	ORCASE(FI_ADDR_PSMX);
 	ORCASE(FI_ADDR_GNI);
 	ORCASE(FI_ADDR_BGQ);
+	ORCASE(FI_ADDR_EFA);
 	ORCASE(FI_ADDR_MLX);
 	ORCASE(FI_ADDR_STR);
 	ORCASE(FI_ADDR_PSMX2);

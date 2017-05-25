@@ -147,6 +147,7 @@ static void oofi_tostr_addr_format(char *buf, uint32_t addr_format)
 	CASEENUMSTR(FI_ADDR_PSMX2);
 	CASEENUMSTR(FI_ADDR_GNI);
 	CASEENUMSTR(FI_ADDR_BGQ);
+	CASEENUMSTR(FI_ADDR_EFA);
 	CASEENUMSTR(FI_ADDR_MLX);
 	CASEENUMSTR(FI_ADDR_STR);
 	default:
@@ -285,6 +286,7 @@ static void ofi_tostr_protocol(char *buf, uint32_t protocol)
 	CASEENUMSTR(FI_PROTO_SHM);
 	CASEENUMSTR(FI_PROTO_RSTREAM);
 	CASEENUMSTR(FI_PROTO_RDMA_CM_IB_XRC);
+	CASEENUMSTR(FI_PROTO_EFA);
 	default:
 		if (protocol & FI_PROV_SPECIFIC)
 			ofi_strcatf(buf, "Provider specific");
