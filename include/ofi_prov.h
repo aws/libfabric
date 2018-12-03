@@ -169,6 +169,17 @@ RXD_INI ;
 #  define RXD_INIT NULL
 #endif
 
+#if (HAVE_RXR) && (HAVE_RXR_DL)
+#  define RXR_INI FI_EXT_INI
+#  define RXR_INIT NULL
+#elif (HAVE_RXR)
+#  define RXR_INI INI_SIG(fi_rxr_ini)
+#  define RXR_INIT fi_rxr_ini()
+RXR_INI ;
+#else
+#  define RXR_INIT NULL
+#endif
+
 #if (HAVE_BGQ) && (HAVE_BGQ_DL)
 #  define BGQ_INI FI_EXT_INI
 #  define BGQ_INIT NULL

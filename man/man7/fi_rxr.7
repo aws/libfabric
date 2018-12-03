@@ -1,0 +1,59 @@
+.TH "fi_rxr" "7" "2016\-09\-27" "Libfabric Programmer\[aq]s Manual" "\@VERSION\@"
+.SH NAME
+.PP
+The RxR (RDM over RDM) Utility Provider
+.SH OVERVIEW
+.PP
+The RxR provider is a utility provider that supports RDM endpoints
+emulated over a base RDM provider.
+.SH SUPPORTED FEATURES
+.PP
+The RxR provider currently supports \f[I]FI_MSG\f[] and \f[I]FI_TAGGED\f[]
+capabilities.
+It requires the base RDM provider to support \f[I]FI_MSG\f[]
+capabilities.
+.PP
+\f[I]Endpoint types\f[] : The provider supports only endpoint type
+\f[I]FI_EP_RDM\f[].
+.PP
+\f[I]Endpoint capabilities\f[] : The following data transfer interface
+is supported: \f[I]fi_msg\f[] and \f[I]fi_tagged\f[].
+.PP
+\f[I]Modes\f[] : The provider does not require the use of any mode bits.
+.PP
+\f[I]Progress\f[] : The RxR provider supports both
+\f[I]FI_PROGRESS_AUTO\f[] and \f[I]FI_PROGRESS_MANUAL\f[], with a
+default set to auto.
+However, receive side data buffers are not modified outside of
+completion processing routines.
+.SH LIMITATIONS
+.PP
+The RxR provider has hard\-coded maximums for supported queue sizes and
+data transfers.
+Some of these limits are set based on the selected base RDM provider.
+.PP
+No support for multi\-recv.
+.PP
+No support for counters.
+.PP
+The RxR provider is still under development and is not extensively
+tested.
+.SH RUNTIME PARAMETERS
+.PP
+The ofi_rxr provider checks for the following environment variables.
+.PP
+\f[I]FI_OFI_RXR_RX_WINDOW_SIZE\f[] : Defines the maximum window size that a
+receiver will return for matched large messages. Defaults to the number of
+available posted receive buffers when the message is handled (0).
+\f[I]FI_OFI_RXR_TX_QUEUE_SIZE\f[] : Defines the maximum number of
+unacknowledged sends to the core provider. RxR does not support a tx queue size
+larger than the core provider.
+\f[I]FI_OFI_RXR_MTU_SIZE\f[] : Defines the maximum message size that RxR will
+send to the core provider. Defaults to the core providers maximum message size.
+\f[I]FI_OFI_RXR_MAX_TIMEOUT\f[] : Defines the maximum timeout in microseconds that RxR will wait to retransmit after receiving a receiver not ready error.
+\f[I]FI_OFI_RXR_TIMEOUT_INTERVAL\f[] : Defines the base time interval in microseconds that RxR will use for exponential backoff after receiving a receiver not ready error.
+.SH SEE ALSO
+.PP
+\f[C]fabric\f[](7), \f[C]fi_provider\f[](7), \f[C]fi_getinfo\f[](3)
+.SH AUTHORS
+OpenFabrics.

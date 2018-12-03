@@ -1,0 +1,27 @@
+if HAVE_RXR
+_rxr_files =				\
+	prov/rxr/src/rxr_attr.c		\
+	prov/rxr/src/rxr_init.c		\
+	prov/rxr/src/rxr_fabric.c	\
+	prov/rxr/src/rxr_domain.c	\
+	prov/rxr/src/rxr_cq.c		\
+	prov/rxr/src/rxr_ep.c		\
+	prov/rxr/src/rxr_av.c		\
+	prov/rxr/src/rxr.h
+
+if HAVE_RXR_DL
+pkglib_LTLIBRARIES += librxr-fi.la
+librxr_fi_la_SOURCES = $(_rxr_files) $(common_srcs)
+librxr_fi_la_LIBADD = $(linkback) $(rxr_shm_LIBS)
+librxr_fi_la_LDFLAGS = -module -avoid-version -shared -export-dynamic
+librxr_fi_la_DEPENDENCIES = $(linkback)
+else !HAVE_RXR_DL
+src_libfabric_la_SOURCES += $(_rxr_files)
+src_libfabric_la_LIBADD += $(rxr_shm_LIBS)
+endif !HAVE_RXR_DL
+
+prov_install_man_pages += man/man7/fi_rxr.7
+
+endif HAVE_RXR
+
+prov_dist_man_pages += man/man7/fi_rxr.7
