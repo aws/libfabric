@@ -1,6 +1,7 @@
 /*
  * Copyright (c) 2016-2017 Cray Inc. All rights reserved.
  * Copyright (c) 2017 Intel Corporation, Inc.  All rights reserved.
+ * Copyright (c) 2019 Amazon.com, Inc. or its affiliates. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -38,7 +39,7 @@
 #include <ofi_mr.h>
 #include <ofi_list.h>
 
-static int util_mr_find_within(void *a, void *b)
+int ofi_mr_find_within(void *a, void *b)
 {
 	struct iovec *iov1 = a, *iov2 = b;
 
@@ -50,7 +51,7 @@ static int util_mr_find_within(void *a, void *b)
 		return 0;
 }
 
-static int util_mr_find_overlap(void *a, void *b)
+int ofi_mr_find_overlap(void *a, void *b)
 {
 	struct iovec *iov1 = a, *iov2 = b;
 
@@ -78,7 +79,7 @@ static void util_mr_free_entry(struct ofi_mr_cache *cache,
 	       (((ssize_t)cache->cached_size - (ssize_t)entry->iov.iov_len) >= 0));
 	cache->cached_cnt--;
 	cache->cached_size -= entry->iov.iov_len;
-	
+
 	util_buf_release(cache->entry_pool, entry);
 }
 
@@ -346,8 +347,8 @@ static int ofi_mr_rbt_storage_erase(struct ofi_mr_storage *storage,
 static int ofi_mr_cache_init_rbt_storage(struct ofi_mr_cache *cache)
 {
 	cache->mr_storage.storage = rbtNew(cache->merge_regions ?
-					   util_mr_find_overlap :
-					   util_mr_find_within);
+					   ofi_mr_find_overlap :
+					   ofi_mr_find_within);
 	if (!cache->mr_storage.storage)
 		return -FI_ENOMEM;
 	cache->mr_storage.destroy = ofi_mr_rbt_storage_destroy;

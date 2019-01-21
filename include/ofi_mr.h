@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2017 Intel Corporation, Inc. All rights reserved.
+ * Copyright (c) 2019 Amazon.com, Inc. or its affiliates. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -257,6 +258,9 @@ struct ofi_mr_cache {
 int ofi_mr_cache_init(struct util_domain *domain, struct ofi_mem_monitor *monitor,
 		      struct ofi_mr_cache *cache);
 void ofi_mr_cache_cleanup(struct ofi_mr_cache *cache);
+
+int ofi_mr_find_within(void *a, void *b);
+int ofi_mr_find_overlap(void *a, void *b);
 
 /* Caller must provide locking around calls */
 bool ofi_mr_cache_flush(struct ofi_mr_cache *cache);
