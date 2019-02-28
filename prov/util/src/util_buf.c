@@ -187,11 +187,6 @@ int util_buf_pool_create_attr(struct util_buf_attr *attr,
 
 	hp_size = ofi_get_hugepage_size();
 
-	if ((*buf_pool)->attr.chunk_cnt * (*buf_pool)->entry_sz < hp_size)
-		(*buf_pool)->attr.is_mmap_region = 0;
-	else
-		(*buf_pool)->attr.is_mmap_region = 1;
-
 	if (!(*buf_pool)->attr.indexing.ordered)
 		slist_init(&(*buf_pool)->list.buffers);
 	else
