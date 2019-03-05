@@ -174,7 +174,6 @@ int util_buf_pool_create_attr(struct util_buf_attr *attr,
 			      struct util_buf_pool **buf_pool)
 {
 	size_t entry_sz;
-	ssize_t hp_size;
 
 	(*buf_pool) = calloc(1, sizeof(**buf_pool));
 	if (!*buf_pool)
@@ -184,8 +183,6 @@ int util_buf_pool_create_attr(struct util_buf_attr *attr,
 
 	entry_sz = (attr->size + sizeof(struct util_buf_footer));
 	(*buf_pool)->entry_sz = fi_get_aligned_sz(entry_sz, attr->alignment);
-
-	hp_size = ofi_get_hugepage_size();
 
 	if (!(*buf_pool)->attr.indexing.ordered)
 		slist_init(&(*buf_pool)->list.buffers);
