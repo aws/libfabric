@@ -298,6 +298,42 @@ AC_CHECK_HEADER(valgrind/memcheck.h, [],
     AC_MSG_ERROR([valgrind requested but <valgrind/memcheck.h> not found.]))
 fi
 
+dnl Check for userfaultfd support
+have_userfaultfd=0
+AC_CHECK_HEADERS([linux/userfaultfd.h],
+    [AC_MSG_CHECKING([for userfaultfd interface])
+     AC_TRY_LINK([#include <sys/types.h>
+#include <linux/userfaultfd.h>
+#include <unistd.h>
+#include <sys/syscall.h>
+#include <fcntl.h>
+],
+        [return syscall(__NR_userfaultfd, O_CLOEXEC | O_NONBLOCK);],
+            [AC_MSG_RESULT([yes])
+             have_userfaultfd=1],
+            [AC_MSG_RESULT([no])
+             have_userfaultfd=0])])
+AS_IF([test "$have_userfaultfd" -eq "1"]
+    [AC_MSG_CHECKING([for userfaultfd unmap support])
+     AC_TRY_LINK([#include <sys/types.h>
+#include <linux/userfaultfd.h>
+#include <unistd.h>
+#include <sys/syscall.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+],
+          [int fd;
+struct uffdio_api api_obj;
+api_obj.api = UFFD_API;
+api_obj.features = UFFD_FEATURE_EVENT_UNMAP | UFFD_FEATURE_EVENT_REMOVE | UFFD_FEATURE_EVENT_REMAP;
+fd = syscall(__NR_userfaultfd, O_CLOEXEC | O_NONBLOCK);
+return ioctl(fd, UFFDIO_API, &api_obj);],
+    [AC_MSG_RESULT([yes])],
+    [AC_MSG_RESULT([no])
+     have_userfaultfd=0])])
+AC_DEFINE_UNQUOTED([HAVE_USERFAULTFD_UNMAP], [$have_userfaultfd],
+    [Defined to 1 if platform supports compiling an application with userfaultfd unmap support])
+
 AC_CACHE_CHECK(whether ld accepts --version-script, ac_cv_version_script,
     [if test -n "`$LD --help < /dev/null 2>/dev/null | grep version-script`"; then
         ac_cv_version_script=yes
