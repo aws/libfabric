@@ -2374,7 +2374,7 @@ static void __rxr_ep_progress(struct rxr_ep *ep)
 			ret = rxr_ep_send_queued_pkts(ep,
 						      &rx_entry->queued_pkts);
 		if (ret == -FI_EAGAIN)
-			return;
+			break;
 		if (OFI_UNLIKELY(ret))
 			goto rx_err;
 
@@ -2391,7 +2391,7 @@ static void __rxr_ep_progress(struct rxr_ep *ep)
 			ret = rxr_ep_send_queued_pkts(ep,
 						      &tx_entry->queued_pkts);
 		if (ret == -FI_EAGAIN)
-			return;
+			break;
 		if (OFI_UNLIKELY(ret))
 			goto tx_err;
 
@@ -2421,8 +2421,12 @@ static void __rxr_ep_progress(struct rxr_ep *ep)
 			if (ep->max_outstanding_tx - ep->tx_pending <= 1 ||
 			    tx_entry->window <= ep->max_data_payload_size)
 				tx_entry->send_flags &= ~FI_MORE;
+			/*
+			 * The core's TX queue is full so we can't do any
+			 * additional work.
+			 */
 			if (ep->tx_pending == ep->max_outstanding_tx)
-				return;
+				goto out;
 			ret = rxr_ep_post_data(ep, tx_entry);
 			if (OFI_UNLIKELY(ret)) {
 				tx_entry->send_flags &= ~FI_MORE;
@@ -2431,6 +2435,7 @@ static void __rxr_ep_progress(struct rxr_ep *ep)
 		}
 	}
 
+out:
 	return;
 rx_err:
 	if (rxr_cq_handle_rx_error(ep, rx_entry, ret))
