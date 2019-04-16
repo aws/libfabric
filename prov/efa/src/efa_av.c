@@ -35,9 +35,10 @@
 #include <malloc.h>
 #include <stdio.h>
 
+#include <infiniband/efadv.h>
+
 #include <ofi_enosys.h>
 #include "efa.h"
-#include "efa_verbs.h"
 
 static inline struct efa_conn *efa_av_tbl_idx_to_conn(struct efa_av *av, fi_addr_t addr)
 {
@@ -53,12 +54,11 @@ static inline struct efa_conn *efa_av_map_addr_to_conn(struct efa_av *av, fi_add
 	return (struct efa_conn *)(void *)addr;
 }
 
-fi_addr_t efa_ah_qpn_to_addr(struct efa_ep *ep, uint16_t ah, uint16_t qpn)
+fi_addr_t efa_ahn_qpn_to_addr(struct efa_av *av, uint16_t ahn, uint16_t qpn)
 {
 	struct efa_reverse_av *reverse_av;
-	struct efa_av *av = ep->av;
 	struct efa_ah_qpn key = {
-		.efa_ah = ah,
+		.ahn = ahn,
 		.qpn = qpn,
 	};
 
@@ -114,9 +114,11 @@ static int efa_av_resize(struct efa_av *av, size_t new_av_count)
 /* Inserts a single AH to AV. */
 static int efa_av_insert_ah(struct efa_av *av, struct efa_ep_addr *addr, fi_addr_t *fi_addr)
 {
-	struct efa_pd *pd = container_of(av->domain->pd, struct efa_pd, ibv_pd);
-	struct ibv_ah_attr ah_attr;
+	struct ibv_pd *ibv_pd = av->domain->ibv_pd;
+	struct ibv_ah_attr ah_attr = { 0 };
+
 	char str[INET6_ADDRSTRLEN] = { 0 };
+	struct efadv_ah_attr attr = { 0 };
 	struct efa_reverse_av *reverse_av;
 	struct efa_ah_qpn key;
 	struct efa_conn *conn;
@@ -138,9 +140,10 @@ static int efa_av_insert_ah(struct efa_av *av, struct efa_ep_addr *addr, fi_addr
 	}
 
 	ah_attr.port_num = 1;
+	ah_attr.is_global = 1;
 	memcpy(ah_attr.grh.dgid.raw, addr->raw, sizeof(addr->raw));
-	conn->ah = efa_cmd_create_ah(pd, &ah_attr);
-	if (!conn->ah) {
+	conn->ah.ibv_ah = ibv_create_ah(ibv_pd, &ah_attr);
+	if (!conn->ah.ibv_ah) {
 		err = -FI_EINVAL;
 		goto err_free_conn;
 	}
@@ -164,7 +167,12 @@ static int efa_av_insert_ah(struct efa_av *av, struct efa_ep_addr *addr, fi_addr
 		break;
 	}
 
-	key.efa_ah = conn->ah->efa_address_handle;
+	err = -efadv_query_ah(conn->ah.ibv_ah, &attr, sizeof(attr));
+	if (err)
+		goto err_destroy_ah;
+
+	conn->ah.ahn = attr.ahn;
+	key.ahn = conn->ah.ahn;
 	key.qpn = addr->qpn;
 	/* This is correct since the same address should be mapped to the same ah. */
 	HASH_FIND(hh, av->reverse_av, &key, sizeof(key), reverse_av);
@@ -188,7 +196,7 @@ static int efa_av_insert_ah(struct efa_av *av, struct efa_ep_addr *addr, fi_addr
 	return FI_SUCCESS;
 
 err_destroy_ah:
-	efa_cmd_destroy_ah(conn->ah);
+	ibv_destroy_ah(conn->ah.ibv_ah);
 err_free_conn:
 	free(conn);
 err_invalid:
@@ -266,7 +274,7 @@ static int efa_av_remove(struct fid_av *av_fid, fi_addr_t *fi_addr,
 		if (!conn)
 			continue;
 
-		key.efa_ah = conn->ah->efa_address_handle;
+		key.ahn = conn->ah.ahn;
 		key.qpn = conn->ep_addr.qpn;
 		HASH_FIND(hh, av->reverse_av, &key, sizeof(key), reverse_av);
 		if (OFI_LIKELY(!!reverse_av)) {
@@ -274,7 +282,7 @@ static int efa_av_remove(struct fid_av *av_fid, fi_addr_t *fi_addr,
 			free(reverse_av);
 		}
 
-		ret = efa_cmd_destroy_ah(conn->ah);
+		ret = -ibv_destroy_ah(conn->ah.ibv_ah);
 		if (ret)
 			return ret;
 
