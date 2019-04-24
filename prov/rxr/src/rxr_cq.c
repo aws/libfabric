@@ -1006,11 +1006,9 @@ static void rxr_cq_handle_data(struct rxr_ep *ep,
 
 	/* we are sinking message for CANCEL/DISCARD entry */
 	if (OFI_LIKELY(!(rx_entry->rxr_flags & RXR_RECV_CANCEL))) {
-		bytes = ofi_copy_to_iov(rx_entry->iov, rx_entry->iov_count,
-					data_pkt->hdr.seg_offset,
-					data_pkt->data, data_pkt->hdr.seg_size);
-		assert(bytes == MIN(rx_entry->total_len - rx_entry->bytes_done,
-				    data_pkt->hdr.seg_size));
+		ofi_copy_to_iov(rx_entry->iov, rx_entry->iov_count,
+				data_pkt->hdr.seg_offset,
+				data_pkt->data, data_pkt->hdr.seg_size);
 	}
 	rx_entry->bytes_done += data_pkt->hdr.seg_size;
 
