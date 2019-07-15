@@ -52,7 +52,6 @@ _efa_headers = \
 	prov/efa/src/efa_verbs/efa_ib.h \
 	prov/efa/src/efa_verbs/efa_io_defs.h \
 	prov/efa/src/efa_verbs/efa_verbs.h \
-	prov/efa/include/compiler.h \
 	prov/efa/include/infiniband/arch.h \
 	prov/efa/include/infiniband/kern-abi.h \
 	prov/efa/include/infiniband/verbs.h

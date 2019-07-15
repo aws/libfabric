@@ -47,7 +47,7 @@ static __u32 efa_cq_sub_cq_get_current_index(struct efa_sub_cq *sub_cq)
 
 static int efa_cq_cqe_is_pending(struct efa_io_cdesc_common *cqe_common, int phase)
 {
-	return (READ_ONCE(cqe_common->flags) & EFA_IO_CDESC_COMMON_PHASE_MASK) == phase;
+	return (cqe_common->flags & EFA_IO_CDESC_COMMON_PHASE_MASK) == phase;
 }
 
 static struct efa_io_cdesc_common *efa_cq_sub_cq_get_cqe(struct efa_sub_cq *sub_cq, int entry)
@@ -226,14 +226,19 @@ static struct efa_io_cdesc_common *cq_next_sub_cqe_get(struct efa_sub_cq *sub_cq
 {
 	struct efa_io_cdesc_common *cqe;
 	__u32 current_index;
+	int is_pending;
 
 	current_index = efa_cq_sub_cq_get_current_index(sub_cq);
 	cqe = efa_cq_sub_cq_get_cqe(sub_cq, current_index);
-	if (efa_cq_cqe_is_pending(cqe, sub_cq->phase)) {
-		/* Do not read the rest of the completion entry before the
-		 * phase bit has been validated.
-		 */
-		rmb();
+	is_pending = efa_cq_cqe_is_pending(cqe, sub_cq->phase);
+	/* We need the rmb() to ensure that the rest of the completion
+	 * entry is only read after the phase bit has been validated.
+	 * We unconditionally call rmb rather than leave it in the for
+	 * loop to prevent the compiler from optimizing out loads of
+	 * the flag if the caller is in a tight loop.
+	 */
+	rmb();
+	if (is_pending) {
 		sub_cq->consumed_cnt++;
 		if (efa_cq_sub_cq_get_current_index(sub_cq) == 0)
 			sub_cq->phase = 1 - sub_cq->phase;

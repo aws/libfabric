@@ -34,7 +34,6 @@
 #define EFA_H
 
 #include "config.h"
-#include "compiler.h"
 
 #include <asm/types.h>
 #include <errno.h>
