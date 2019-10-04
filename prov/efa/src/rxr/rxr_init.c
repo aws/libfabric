@@ -49,7 +49,7 @@ struct rxr_env rxr_env = {
 	.tx_min_credits = RXR_DEF_MIN_TX_CREDITS,
 	.tx_queue_size = 0,
 	.enable_sas_ordering = 1,
-	.enable_shm_transfer = 1,
+	.enable_shm_transfer = 0,
 	.shm_av_size = 128,
 	.shm_max_medium_size = 4096,
 	.recvwin_size = RXR_RECVWIN_SIZE,
@@ -570,7 +570,7 @@ EFA_INI
 	fi_param_define(&rxr_prov, "enable_sas_ordering", FI_PARAM_INT,
 			"Enable packet reordering for the RDM endpoint. This is always enabled when FI_ORDER_SAS is requested by the application. (Default: 1)");
 	fi_param_define(&rxr_prov, "enable_shm_transfer", FI_PARAM_INT,
-			"Enable using SHM provider to provide the communication between processes on the same system. (Default: 1)");
+			"Enable using SHM provider to provide the communication between processes on the same system. (Default: 0)");
 	fi_param_define(&rxr_prov, "shm_av_size", FI_PARAM_INT,
 			"Defines the maximum number of entries in SHM provider's address vector (Default 128).");
 	fi_param_define(&rxr_prov, "shm_max_medium_size", FI_PARAM_INT,
