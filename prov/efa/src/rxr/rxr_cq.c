@@ -1040,7 +1040,7 @@ static int rxr_cq_process_rts(struct rxr_ep *ep,
 		return ret;
 	}
 
-	if (is_local) {
+	if (rxr_env.enable_shm_transfer && is_local) {
 		if (pkt_entry->type == RXR_PKT_ENTRY_POSTED)
 			ep->rx_bufs_shm_to_post++;
 		goto shm_large_msg_out;
