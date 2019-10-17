@@ -1184,6 +1184,7 @@ static void rxr_cq_handle_shm_rma_write_data(struct rxr_ep *ep, struct fi_cq_dat
 			assert(0 && "failed to write err cq entry");
 	}
 	rxr_cntr_report_rx_completion(ep, rx_entry);
+	rxr_release_rx_entry(ep, rx_entry);
 }
 
 /*
