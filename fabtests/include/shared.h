@@ -254,7 +254,7 @@ extern char default_port[8];
 	}
 
 #define FT_STR_LEN 32
-#define FT_MAX_CTRL_MSG 64
+#define FT_MAX_CTRL_MSG 256
 #define FT_MR_KEY 0xC0DE
 #define FT_MSG_MR_ACCESS (FI_SEND | FI_RECV)
 #define FT_RMA_MR_ACCESS (FI_READ | FI_WRITE | FI_REMOTE_READ | FI_REMOTE_WRITE)
