@@ -430,8 +430,10 @@ int efa_cmd_create_qp(struct efa_qp *qp, struct efa_pd *pd, struct ibv_qp_init_a
 	params.QpType = (init_attr->qp_type == IBV_QPT_UD) ? EFA_WIN_QP_UD : EFA_WIN_QP_SRD;
 	params.SendCqIndex = init_attr->send_cq->handle;
 	params.RecvCqIndex = init_attr->recv_cq->handle;
-	params.RqRingSizeInBytes = roundup_pow_of_two(init_attr->cap.max_recv_wr * init_attr->cap.max_recv_sge) * sizeof(struct efa_io_rx_desc);
-	params.SqRingSizeInBytes = init_attr->cap.max_send_wr * sizeof(struct efa_io_tx_wqe);
+       params.SqDepth = qp->sq.wq.wqe_cnt;
+       params.RqDepth = qp->rq.wq.wqe_cnt;
+       params.RqRingSizeInBytes = (qp->rq.wq.desc_mask + 1) * sizeof(struct efa_io_rx_desc);
+       params.SqRingSizeInBytes = (qp->sq.wq.desc_mask + 1) * sizeof(struct efa_io_tx_wqe);
 
 	err = efa_win_create_qp(edev, &params, &result);
 	if (err)
