@@ -6,11 +6,12 @@
 /* Temporary till user mode portion is able to enumerate device interfaces to get the sym links */
 #define EFA_DEVICE_NAME "\\\\.\\EFADevice"
 
-#define EFA_FUNCTION(r_, i_)	(r_ << 6 | i_)
-#define IOCTL_EFA(r_, i_)	CTL_CODE( FILE_DEVICE_NETWORK, EFA_FUNCTION(r_, i_), METHOD_BUFFERED, FILE_ANY_ACCESS )
+#define IOCTL_EFA(i_)   CTL_CODE( FILE_DEVICE_UNKNOWN, i_, METHOD_BUFFERED, FILE_ANY_ACCESS )
 
 #define EFA_API_INTERFACE_VERSION 1
 #define EFA_GID_SIZE 16
+#define MR_READ_PERMISSION 0
+#define MR_READ_WRITE_PERMISSION 1
 
 /* Supported Queue Pair types */
 typedef enum EFA_WIN_QP_TYPE {
@@ -150,16 +151,16 @@ typedef struct EFA_DEALLOC_PD_PARAMS {
 	UINT16 Pdn;
 }EFA_DEALLOC_PD_PARAMS, *PEFA_DEALLOC_PD_PARAMS;
 
-#define IOCTL_EFA_QUERY_DEVICE IOCTL_EFA(0, 1)
-#define IOCTL_EFA_CREATE_CQ IOCTL_EFA(0, 3)
-#define IOCTL_EFA_DESTROY_CQ IOCTL_EFA(0, 4)
-#define IOCTL_EFA_CREATE_QP IOCTL_EFA(0, 5)
-#define IOCTL_EFA_DESTROY_QP IOCTL_EFA(0, 6)
-#define IOCTL_EFA_REG_MR IOCTL_EFA(0, 7)
-#define IOCTL_EFA_DEREG_MR IOCTL_EFA(0, 8)
-#define IOCTL_EFA_ALLOC_AH IOCTL_EFA(0, 9)
-#define IOCTL_EFA_DEALLOC_AH IOCTL_EFA(0, 10)
-#define IOCTL_EFA_ALLOC_PD IOCTL_EFA(0, 11)
-#define IOCTL_EFA_DEALLOC_PD IOCTL_EFA(0, 12)
+#define IOCTL_EFA_QUERY_DEVICE          IOCTL_EFA(0x801)
+#define IOCTL_EFA_CREATE_CQ             IOCTL_EFA(0x802)
+#define IOCTL_EFA_DESTROY_CQ            IOCTL_EFA(0x803)
+#define IOCTL_EFA_CREATE_QP             IOCTL_EFA(0x804)
+#define IOCTL_EFA_DESTROY_QP            IOCTL_EFA(0x805)
+#define IOCTL_EFA_REG_MR                IOCTL_EFA(0x806)
+#define IOCTL_EFA_DEREG_MR              IOCTL_EFA(0x807)
+#define IOCTL_EFA_ALLOC_AH              IOCTL_EFA(0x808)
+#define IOCTL_EFA_DEALLOC_AH            IOCTL_EFA(0x809)
+#define IOCTL_EFA_ALLOC_PD              IOCTL_EFA(0x80a)
+#define IOCTL_EFA_DEALLOC_PD            IOCTL_EFA(0x80b)
 
 #endif
