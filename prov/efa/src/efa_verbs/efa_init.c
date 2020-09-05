@@ -263,10 +263,10 @@ static struct ibv_device *device_init(struct ibv_sysfs_dev *sysfs_dev)
 
 	dev = &vdev->device;
 
-	strcpy(dev->dev_name,   sysfs_dev->sysfs_name);
-	strcpy(dev->dev_path,   sysfs_dev->sysfs_path);
-	strcpy(dev->name,       sysfs_dev->ibdev_name);
-	strcpy(dev->ibdev_path, sysfs_dev->ibdev_path);
+	strncpy(dev->dev_name,   sysfs_dev->sysfs_name, sizeof(dev->dev_name));
+	strncpy(dev->dev_path,   sysfs_dev->sysfs_path, sizeof(dev->dev_path));
+	strncpy(dev->name,       sysfs_dev->ibdev_name, sizeof(dev->name));
+	strncpy(dev->ibdev_path, sysfs_dev->ibdev_path, sizeof(dev->ibdev_path));
 
 	return dev;
 }
