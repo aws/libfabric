@@ -79,15 +79,6 @@
     <Filter Include="Source Files\prov\rxd\include">
       <UniqueIdentifier>{e89f94da-f0f0-4e62-aad4-d738963d7dd9}</UniqueIdentifier>
     </Filter>
-    <Filter Include="Source Files\prov\netdir">
-      <UniqueIdentifier>{bbe0be7c-1187-45ab-bd2e-5c1f61095a9b}</UniqueIdentifier>
-    </Filter>
-    <Filter Include="Source Files\prov\netdir\include">
-      <UniqueIdentifier>{9ba21998-278b-4f63-9ff2-8fb533eeee84}</UniqueIdentifier>
-    </Filter>
-    <Filter Include="Source Files\prov\netdir\src">
-      <UniqueIdentifier>{b3471da7-1f83-4d3f-b31c-89b197aa6327}</UniqueIdentifier>
-    </Filter>
     <Filter Include="Source Files\prov\tcp">
       <UniqueIdentifier>{aed54cba-a4cd-4598-8bfc-1ece52f387ee}</UniqueIdentifier>
     </Filter>
@@ -108,6 +99,27 @@
     </Filter>
     <Filter Include="Source Files\prov\hook\perf\src">
       <UniqueIdentifier>{be316a01-6bff-4203-b070-ffaa66bb398e}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\prov\efa">
+      <UniqueIdentifier>{a8d01445-d81d-4281-bc14-d34e275f6e70}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\prov\efa\src">
+      <UniqueIdentifier>{dcc85098-2352-44b3-a90d-f1210593f93b}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\prov\efa\include">
+      <UniqueIdentifier>{60fefa30-dac7-4c3e-aca8-6c0f07f07bb3}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\prov\efa\src\rxr">
+      <UniqueIdentifier>{8b55ea78-bd5a-4b6a-90a8-575f038f2b20}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\prov\efa\src\efa_verbs">
+      <UniqueIdentifier>{ae166190-63eb-4b8a-acf7-0eb6be2c71d4}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\prov\efa\include\infiniband">
+      <UniqueIdentifier>{004ba6e3-628f-44ee-a823-5e98690121b8}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\prov\efa\src\efa_verbs\plat">
+      <UniqueIdentifier>{5d939001-cad1-419b-8964-438c028d093e}</UniqueIdentifier>
     </Filter>
   </ItemGroup>
   <ItemGroup>
@@ -345,57 +357,6 @@
     <ClCompile Include="src\iov.c">
       <Filter>Source Files\src</Filter>
     </ClCompile>
-    <ClCompile Include="prov\netdir\src\netdir_addr.c">
-      <Filter>Source Files\prov\netdir\src</Filter>
-    </ClCompile>
-    <ClCompile Include="prov\netdir\src\netdir_cq.c">
-      <Filter>Source Files\prov\netdir\src</Filter>
-    </ClCompile>
-    <ClCompile Include="prov\netdir\src\netdir_domain.c">
-      <Filter>Source Files\prov\netdir\src</Filter>
-    </ClCompile>
-    <ClCompile Include="prov\netdir\src\netdir_ep.c">
-      <Filter>Source Files\prov\netdir\src</Filter>
-    </ClCompile>
-    <ClCompile Include="prov\netdir\src\netdir_fabric.c">
-      <Filter>Source Files\prov\netdir\src</Filter>
-    </ClCompile>
-    <ClCompile Include="prov\netdir\src\netdir_fs.c">
-      <Filter>Source Files\prov\netdir\src</Filter>
-    </ClCompile>
-    <ClCompile Include="prov\netdir\src\netdir_init.c">
-      <Filter>Source Files\prov\netdir\src</Filter>
-    </ClCompile>
-    <ClCompile Include="prov\netdir\src\netdir_pep.c">
-      <Filter>Source Files\prov\netdir\src</Filter>
-    </ClCompile>
-    <ClCompile Include="prov\netdir\src\netdir_eq.c">
-      <Filter>Source Files\prov\netdir\src</Filter>
-    </ClCompile>
-    <ClCompile Include="prov\netdir\src\netdir_ov.c">
-      <Filter>Source Files\prov\netdir\src</Filter>
-    </ClCompile>
-    <ClCompile Include="prov\netdir\src\netdir_mr.c">
-      <Filter>Source Files\prov\netdir\src</Filter>
-    </ClCompile>
-    <ClCompile Include="prov\netdir\src\netdir_cntr.c">
-      <Filter>Source Files\prov\netdir\src</Filter>
-    </ClCompile>
-    <ClCompile Include="prov\netdir\src\netdir_ep_msg.c">
-      <Filter>Source Files\prov\netdir\src</Filter>
-    </ClCompile>
-    <ClCompile Include="prov\netdir\src\netdir_ep_rma.c">
-      <Filter>Source Files\prov\netdir\src</Filter>
-    </ClCompile>
-    <ClCompile Include="prov\netdir\src\netdir_ep_srx.c">
-      <Filter>Source Files\prov\netdir\src</Filter>
-    </ClCompile>
-    <ClCompile Include="prov\netdir\src\netdir_unexp.c">
-      <Filter>Source Files\prov\netdir\src</Filter>
-    </ClCompile>
-    <ClCompile Include="prov\netdir\src\netdir_ndinit.c">
-      <Filter>Source Files\prov\netdir\src</Filter>
-    </ClCompile>
     <ClCompile Include="prov\util\src\util_ns.c">
       <Filter>Source Files\prov\util</Filter>
     </ClCompile>
@@ -488,6 +449,66 @@
     </ClCompile>
     <ClCompile Include="src\shared\ofi_str.c">
       <Filter>Source Files\src</Filter>
+    </ClCompile>
+    <ClCompile Include="prov\efa\src\rxr\rxr_attr.c">
+      <Filter>Source Files\prov\efa\src\rxr</Filter>
+    </ClCompile>
+    <ClCompile Include="prov\efa\src\rxr\rxr_av.c">
+      <Filter>Source Files\prov\efa\src\rxr</Filter>
+    </ClCompile>
+    <ClCompile Include="prov\efa\src\rxr\rxr_cntr.c">
+      <Filter>Source Files\prov\efa\src\rxr</Filter>
+    </ClCompile>
+    <ClCompile Include="prov\efa\src\rxr\rxr_cq.c">
+      <Filter>Source Files\prov\efa\src\rxr</Filter>
+    </ClCompile>
+    <ClCompile Include="prov\efa\src\rxr\rxr_domain.c">
+      <Filter>Source Files\prov\efa\src\rxr</Filter>
+    </ClCompile>
+    <ClCompile Include="prov\efa\src\rxr\rxr_ep.c">
+      <Filter>Source Files\prov\efa\src\rxr</Filter>
+    </ClCompile>
+    <ClCompile Include="prov\efa\src\rxr\rxr_fabric.c">
+      <Filter>Source Files\prov\efa\src\rxr</Filter>
+    </ClCompile>
+    <ClCompile Include="prov\efa\src\rxr\rxr_init.c">
+      <Filter>Source Files\prov\efa\src\rxr</Filter>
+    </ClCompile>
+    <ClCompile Include="prov\efa\src\rxr\rxr_rma.c">
+      <Filter>Source Files\prov\efa\src\rxr</Filter>
+    </ClCompile>
+    <ClCompile Include="prov\efa\src\efa_av.c">
+      <Filter>Source Files\prov\efa\src</Filter>
+    </ClCompile>
+    <ClCompile Include="prov\efa\src\efa_cm.c">
+      <Filter>Source Files\prov\efa\src</Filter>
+    </ClCompile>
+    <ClCompile Include="prov\efa\src\efa_cq.c">
+      <Filter>Source Files\prov\efa\src</Filter>
+    </ClCompile>
+    <ClCompile Include="prov\efa\src\efa_domain.c">
+      <Filter>Source Files\prov\efa\src</Filter>
+    </ClCompile>
+    <ClCompile Include="prov\efa\src\efa_ep.c">
+      <Filter>Source Files\prov\efa\src</Filter>
+    </ClCompile>
+    <ClCompile Include="prov\efa\src\efa_fabric.c">
+      <Filter>Source Files\prov\efa\src</Filter>
+    </ClCompile>
+    <ClCompile Include="prov\efa\src\efa_mr.c">
+      <Filter>Source Files\prov\efa\src</Filter>
+    </ClCompile>
+    <ClCompile Include="prov\efa\src\efa_msg.c">
+      <Filter>Source Files\prov\efa\src</Filter>
+    </ClCompile>
+    <ClCompile Include="prov\efa\src\efa_verbs\plat\efa_win_plat.c">
+      <Filter>Source Files\prov\efa\src\efa_verbs\plat</Filter>
+    </ClCompile>
+    <ClCompile Include="prov\efa\src\efa_verbs\plat\efawinif.cpp">
+      <Filter>Source Files\prov\efa\src\efa_verbs\plat</Filter>
+    </ClCompile>
+    <ClCompile Include="prov\efa\src\efa_verbs\plat\efa_win_cmd.c">
+      <Filter>Source Files\prov\efa\src\efa_verbs\plat</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
@@ -662,33 +683,6 @@
     <ClInclude Include="prov\rxm\src\rxm.h">
       <Filter>Source Files\prov\rxm\include</Filter>
     </ClInclude>
-    <ClInclude Include="prov\netdir\src\netdir.h">
-      <Filter>Source Files\prov\netdir\include</Filter>
-    </ClInclude>
-    <ClInclude Include="prov\netdir\src\netdir_log.h">
-      <Filter>Source Files\prov\netdir\include</Filter>
-    </ClInclude>
-    <ClInclude Include="prov\netdir\src\netdir_iface.h">
-      <Filter>Source Files\prov\netdir\include</Filter>
-    </ClInclude>
-    <ClInclude Include="prov\netdir\src\netdir_ov.h">
-      <Filter>Source Files\prov\netdir\include</Filter>
-    </ClInclude>
-    <ClInclude Include="prov\netdir\src\netdir_util.h">
-      <Filter>Source Files\prov\netdir\include</Filter>
-    </ClInclude>
-    <ClInclude Include="prov\netdir\src\netdir_queue.h">
-      <Filter>Source Files\prov\netdir\include</Filter>
-    </ClInclude>
-    <ClInclude Include="prov\netdir\src\netdir_cq.h">
-      <Filter>Source Files\prov\netdir\include</Filter>
-    </ClInclude>
-    <ClInclude Include="prov\netdir\src\netdir_unexp.h">
-      <Filter>Source Files\prov\netdir\include</Filter>
-    </ClInclude>
-    <ClInclude Include="prov\netdir\src\netdir_buf.h">
-      <Filter>Source Files\prov\netdir\include</Filter>
-    </ClInclude>
     <ClInclude Include="include\windows\sys\wait.h">
       <Filter>Header Files\windows\sys</Filter>
     </ClInclude>
@@ -724,6 +718,45 @@
     </ClInclude>
     <ClInclude Include="include\ofi_hook.h">
       <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="prov\efa\src\efa.h">
+      <Filter>Source Files\prov\efa\include</Filter>
+    </ClInclude>
+    <ClInclude Include="prov\efa\src\efa_verbs\efa_cmd.h">
+      <Filter>Source Files\prov\efa\include</Filter>
+    </ClInclude>
+    <ClInclude Include="prov\efa\src\efa_verbs\efa_ib.h">
+      <Filter>Source Files\prov\efa\include</Filter>
+    </ClInclude>
+    <ClInclude Include="prov\efa\src\efa_verbs\efa_ib_cmd.h">
+      <Filter>Source Files\prov\efa\include</Filter>
+    </ClInclude>
+    <ClInclude Include="prov\efa\src\efa_verbs\efa_io_defs.h">
+      <Filter>Source Files\prov\efa\include</Filter>
+    </ClInclude>
+    <ClInclude Include="prov\efa\src\efa_verbs\efa_verbs.h">
+      <Filter>Source Files\prov\efa\include</Filter>
+    </ClInclude>
+    <ClInclude Include="prov\efa\src\efa_verbs\efa-abi.h">
+      <Filter>Source Files\prov\efa\include</Filter>
+    </ClInclude>
+    <ClInclude Include="prov\efa\include\infiniband\efa_arch.h">
+      <Filter>Source Files\prov\efa\include\infiniband</Filter>
+    </ClInclude>
+    <ClInclude Include="prov\efa\include\infiniband\efa_kern-abi.h">
+      <Filter>Source Files\prov\efa\include\infiniband</Filter>
+    </ClInclude>
+    <ClInclude Include="prov\efa\include\infiniband\efa_verbs.h">
+      <Filter>Source Files\prov\efa\include\infiniband</Filter>
+    </ClInclude>
+    <ClInclude Include="prov\efa\src\efa_verbs\plat\efa_win_plat.h">
+      <Filter>Source Files\prov\efa\src\efa_verbs\plat</Filter>
+    </ClInclude>
+    <ClInclude Include="prov\efa\src\efa_verbs\plat\EfaIoctl.h">
+      <Filter>Source Files\prov\efa\src\efa_verbs\plat</Filter>
+    </ClInclude>
+    <ClInclude Include="prov\efa\src\efa_verbs\plat\efawinif.h">
+      <Filter>Source Files\prov\efa\src\efa_verbs\plat</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>

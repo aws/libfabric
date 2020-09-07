@@ -121,7 +121,8 @@ static int efa_ep_sq_initialize(struct efa_qp *qp, struct efa_create_qp_resp *re
 	desc_ring_size = qp->sq.wq.wqe_cnt * sizeof(struct efa_io_tx_wqe);
 	qp->sq.desc_ring_mmap_size = align(desc_ring_size + qp->sq.desc_offset, qp->page_size);
 	qp->sq.max_inline_data = resp->ibv_resp.max_inline_data;
-
+	// On windows efa_cmd_create_cq handles memory mapping for application, mmap() unneeded
+#ifndef _WIN32
 	qp->sq.desc = mmap(NULL, qp->sq.desc_ring_mmap_size, PROT_WRITE,
 			   MAP_SHARED, fd, resp->efa_resp.llq_desc_mmap_key);
 	if (qp->sq.desc == MAP_FAILED)
@@ -132,13 +133,17 @@ static int efa_ep_sq_initialize(struct efa_qp *qp, struct efa_create_qp_resp *re
 	if (db_base == MAP_FAILED)
 		goto err_unmap_desc_ring;
 	qp->sq.db = (uint32_t *)(db_base + resp->efa_resp.sq_db_offset);
+#endif //!_WIN32
 	qp->sq.sub_cq_idx = resp->efa_resp.send_sub_cq_idx;
 
 	return 0;
 
 err_unmap_desc_ring:
+	// Windows does not use mmap, thus does not need to munmap
+#ifndef _WIN32
 	if (munmap(qp->sq.desc - qp->sq.desc_offset, qp->sq.desc_ring_mmap_size))
 		EFA_WARN(FI_LOG_EP_CTRL, "qp[%u]: desc unmap failed!\n", qp->qp_num);
+#endif
 err_terminate_wq:
 	efa_ep_wq_terminate(&qp->sq.wq);
 	return -EINVAL;
@@ -152,10 +157,13 @@ static void efa_ep_sq_terminate(struct efa_qp *qp)
 		return;
 
 	db_aligned = (void *)((__u64)qp->sq.db & ~(qp->page_size - 1));
+	// Windows does not use mmap, thus does not need to munmap
+#ifndef _WIN32
 	if (munmap(db_aligned, qp->page_size))
 		EFA_WARN(FI_LOG_EP_CTRL, "qp[%u]: sq db unmap failed!\n", qp->qp_num);
 	if (munmap(qp->sq.desc - qp->sq.desc_offset, qp->sq.desc_ring_mmap_size))
 		EFA_WARN(FI_LOG_EP_CTRL, "qp[%u]: desc data unmap failed!\n", qp->qp_num);
+#endif // !_WIN32
 
 	efa_ep_wq_terminate(&qp->sq.wq);
 }
@@ -168,10 +176,13 @@ static void efa_ep_rq_terminate(struct efa_qp *qp)
 		return;
 
 	db_aligned = (void *)((__u64)qp->rq.db & ~(qp->page_size - 1));
+	// Windows does not use mmap, thus does not need to munmap
+#ifndef _WIN32
 	if (munmap(db_aligned, qp->page_size))
 		EFA_WARN(FI_LOG_EP_CTRL, "qp[%u]: rq db unmap failed!\n", qp->qp_num);
 	if (munmap(qp->rq.buf, qp->rq.buf_size))
 		EFA_WARN(FI_LOG_EP_CTRL, "qp[%u]: rq buffer unmap failed!\n", qp->qp_num);
+#endif // !_WIN32
 
 	efa_ep_wq_terminate(&qp->rq.wq);
 }
@@ -188,6 +199,8 @@ static int efa_ep_rq_initialize(struct efa_qp *qp, struct efa_create_qp_resp *re
 	if (err)
 		return err;
 
+	// On windows efa_cmd_create_cq handles memory mapping for application, mmap() unneeded
+#ifndef _WIN32
 	qp->rq.buf_size = resp->efa_resp.rq_mmap_size;
 	qp->rq.buf = mmap(NULL, qp->rq.buf_size, PROT_WRITE, MAP_SHARED, fd, resp->efa_resp.rq_mmap_key);
 	if (qp->rq.buf == MAP_FAILED)
@@ -197,13 +210,17 @@ static int efa_ep_rq_initialize(struct efa_qp *qp, struct efa_create_qp_resp *re
 	if (db_base == MAP_FAILED)
 		goto err_unmap_rq_buf;
 	qp->rq.db = (uint32_t *)(db_base + resp->efa_resp.rq_db_offset);
+#endif //!_WIN32
 	qp->rq.sub_cq_idx = resp->efa_resp.recv_sub_cq_idx;
 
 	return 0;
 
 err_unmap_rq_buf:
+	// Windows does not use mmap, thus does not need to munmap
+#ifndef _WIN32
 	if (munmap(qp->rq.buf, qp->rq.buf_size))
 		EFA_WARN(FI_LOG_EP_CTRL, "qp[%u]: rq buf unmap failed!\n", qp->qp_num);
+#endif //!_WIN32
 err_terminate_wq:
 	efa_ep_wq_terminate(&qp->rq.wq);
 	return -EINVAL;

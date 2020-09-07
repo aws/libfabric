@@ -69,7 +69,7 @@ fi_addr_t efa_ah_qpn_to_addr(struct efa_ep *ep, uint16_t ah, uint16_t qpn)
 
 static inline int efa_av_is_valid_address(struct efa_ep_addr *addr)
 {
-	struct efa_ep_addr all_zeros = {};
+	struct efa_ep_addr all_zeros = {0};
 
 	return memcmp(addr->raw, all_zeros.raw, sizeof(addr->raw));
 }
@@ -190,7 +190,7 @@ static int efa_av_insert_ah(struct efa_av *av, struct efa_ep_addr *addr, fi_addr
 err_destroy_ah:
 	efa_cmd_destroy_ah(conn->ah);
 err_free_conn:
-	free(conn);
+	ofi_freealign(conn);
 err_invalid:
 	*fi_addr = FI_ADDR_NOTAVAIL;
 	return err;
@@ -283,7 +283,7 @@ static int efa_av_remove(struct fid_av *av_fid, fi_addr_t *fi_addr,
 		EFA_INFO(FI_LOG_AV, "av_remove conn[%p] with GID[%s] QP[%u]\n", conn,
 			 str, conn->ep_addr.qpn);
 
-		free(conn);
+		ofi_freealign(conn);
 		av->used--;
 	}
 	return ret;

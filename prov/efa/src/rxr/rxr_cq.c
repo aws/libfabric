@@ -1347,21 +1347,33 @@ fi_addr_t rxr_cq_insert_addr_from_rts(struct rxr_ep *ep, struct rxr_pkt_entry *p
 	assert(rts_hdr->addrlen > 0);
 	if (rxr_get_base_hdr(pkt_entry->pkt)->version !=
 	    RXR_PROTOCOL_VERSION) {
-		char buffer[ep->core_addrlen * 3];
+		size_t buffer_len = ep->core_addrlen * 3;
+		char *buffer = malloc(buffer_len);
 		int length = 0;
-
-		for (i = 0; i < ep->core_addrlen; i++)
-			length += sprintf(&buffer[length], "%02x ",
-					  ep->core_addr[i]);
-		FI_WARN(&rxr_prov, FI_LOG_CQ,
-			"Host %s:Invalid protocol version %d. Expected protocol version %d.\n",
-			buffer,
-			rxr_get_base_hdr(pkt_entry->pkt)->version,
-			RXR_PROTOCOL_VERSION);
+		if (buffer)
+		{
+			for (i = 0; i < ep->core_addrlen; i++)
+				length += sprintf(&buffer[length], "%02x ",
+					ep->core_addr[i]);
+			FI_WARN(&rxr_prov, FI_LOG_CQ,
+				"Host %s:Invalid protocol version %d. Expected protocol version %d.\n",
+				buffer,
+				rxr_get_base_hdr(pkt_entry->pkt)->version,
+				RXR_PROTOCOL_VERSION);
+		}
+		else
+		{
+			FI_WARN(&rxr_prov, FI_LOG_CQ,
+				"Invalid protocol version %d. Expected protocol version %d.\n",
+				rxr_get_base_hdr(pkt_entry->pkt)->version,
+				RXR_PROTOCOL_VERSION);
+		}
 		rxr_eq_write_error(ep, FI_EIO, -FI_EINVAL);
 		fprintf(stderr, "Invalid protocol version %d. Expected protocol version %d. %s:%d\n",
 			rxr_get_base_hdr(pkt_entry->pkt)->version,
 			RXR_PROTOCOL_VERSION, __FILE__, __LINE__);
+		if (buffer)
+			free(buffer);
 		abort();
 	}
 

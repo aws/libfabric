@@ -42,7 +42,9 @@
 #include <unistd.h>
 #include <stdlib.h>
 
+#ifndef _WIN32
 #include <alloca.h>
+#endif
 #include <errno.h>
 
 #include <rdma/fi_errno.h>

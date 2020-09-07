@@ -124,7 +124,7 @@ static ssize_t efa_post_recv_validate(struct efa_ep *ep, const struct fi_msg *ms
 static ssize_t efa_post_recv(struct efa_ep *ep, const struct fi_msg *msg, uint64_t flags)
 {
 	struct efa_qp *qp = ep->qp;
-	struct efa_io_rx_desc rx_buf = {};
+	struct efa_io_rx_desc rx_buf = {0};
 	uint32_t wqe_index, rq_desc_offset;
 	size_t i;
 	ssize_t err;
@@ -352,7 +352,7 @@ static ssize_t efa_post_send(struct efa_ep *ep, const struct fi_msg *msg, uint64
 {
 	struct efa_qp *qp = ep->qp;
 	struct efa_io_tx_meta_desc *meta_desc;
-	struct efa_io_tx_wqe tx_wqe = {};
+	struct efa_io_tx_wqe tx_wqe = {0};
 	uint32_t sq_desc_offset, wrid_idx;
 	int desc_size = sizeof(tx_wqe.common) + sizeof(tx_wqe.u);
 	struct efa_conn *conn;

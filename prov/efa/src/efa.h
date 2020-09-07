@@ -35,7 +35,6 @@
 
 #include "config.h"
 
-#include <asm/types.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <arpa/inet.h>
@@ -47,10 +46,16 @@
 #include <unistd.h>
 #include <assert.h>
 #include <pthread.h>
-#include <sys/epoll.h>
 #include <uthash.h>
-
+#ifndef _WIN32
+#include <asm/types.h>
+#include <sys/epoll.h>
 #include "infiniband/efa_arch.h"
+#else
+#include "efawinif.h"
+#include "efa_win_plat.h"
+#endif
+
 #include "infiniband/efa_verbs.h"
 #include <rdma/fabric.h>
 #include <rdma/fi_cm.h>
@@ -192,6 +197,11 @@ struct efa_device {
 	struct verbs_device		verbs_dev;
 	int				page_size;
 	int				abi_version;
+#if _WIN32
+	HANDLE				device;
+	// Here we cache the attributes returned from the device when we query it.
+	EFA_DEVICE_INFO			dev_attr;
+#endif
 };
 
 struct efa_context {
@@ -377,6 +387,10 @@ static inline uint32_t align_up_queue_size(uint32_t req)
 }
 
 #define is_power_of_2(x) (!(x == 0) && !(x & (x - 1)))
+#ifdef _WIN32
+INT64 align_down_to_power_of_2(INT64 n);
+// MSVC Compiler does not recognize the syntax used in the macro below.
+#else
 #define align_down_to_power_of_2(x)		\
 	({					\
 		__typeof__(x) n = (x);		\
@@ -384,7 +398,7 @@ static inline uint32_t align_up_queue_size(uint32_t req)
 			n = n & (n - 1);	\
 		n;				\
 	})
-
+#endif
 extern const struct efa_ep_domain efa_rdm_domain;
 extern const struct efa_ep_domain efa_dgrm_domain;
 

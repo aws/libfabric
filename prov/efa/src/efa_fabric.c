@@ -266,9 +266,9 @@ static int efa_alloc_fid_nic(struct fi_info *fi, struct efa_context *ctx,
 	char dbdf_real_path[PATH_MAX];
 	struct fi_bus_attr *bus_attr;
 	struct fi_pci_attr *pci_attr;
-	char *driver_sym_path;
-	char *dbdf_sym_path;
-	char *sysfs_path;
+	char *driver_sym_path = NULL;
+	char *dbdf_sym_path = NULL;
+	char *sysfs_path = NULL;
 	void *src_addr;
 	char *driver;
 	int name_len;
@@ -300,6 +300,7 @@ static int efa_alloc_fid_nic(struct fi_info *fi, struct efa_context *ctx,
 		goto err_free_nic;
 	}
 
+#ifndef _WIN32
 	device_attr->device_version = calloc(1, EFA_ABI_VER_MAX_LEN + 1);
 	if (!device_attr->device_version) {
 		ret = -FI_ENOMEM;
@@ -317,6 +318,13 @@ static int efa_alloc_fid_nic(struct fi_info *fi, struct efa_context *ctx,
 			   sizeof(device_attr->device_version));
 	if (ret < 0)
 		goto err_free_sysfs;
+#else
+	ret = asprintf(&device_attr->device_version, "%u", efa_device_attr->ibv_attr.hw_ver);
+	if (ret < 0) {
+		ret = -FI_ENOMEM;
+		goto err_free_nic;
+	}
+#endif
 
 	ret = asprintf(&device_attr->vendor_id, "0x%x",
 		       efa_device_attr->ibv_attr.vendor_id);
@@ -325,6 +333,7 @@ static int efa_alloc_fid_nic(struct fi_info *fi, struct efa_context *ctx,
 		goto err_free_sysfs;
 	}
 
+#ifndef _WIN32
 	ret = asprintf(&driver_sym_path, "%s%s",
 		       ctx->ibv_ctx.device->ibdev_path, "/device/driver");
 	if (ret < 0) {
@@ -348,6 +357,13 @@ static int efa_alloc_fid_nic(struct fi_info *fi, struct efa_context *ctx,
 		ret = -FI_ENOMEM;
 		goto err_free_driver_sym;
 	}
+#else
+	ret = asprintf(&device_attr->driver, "%s", "efa.sys");
+	if (ret < 0) {
+		ret = -FI_ENOMEM;
+		goto err_free_driver_sym;
+	}
+#endif // _WIN32
 
 	device_attr->firmware = strdup(efa_device_attr->ibv_attr.fw_ver);
 	if (!device_attr->firmware) {
@@ -359,6 +375,7 @@ static int efa_alloc_fid_nic(struct fi_info *fi, struct efa_context *ctx,
 	bus_attr->bus_type = FI_BUS_PCI;
 
 	/* fi_pci_attr */
+#ifndef _WIN32
 	ret = asprintf(&dbdf_sym_path, "%s%s",
 		       ctx->ibv_ctx.device->ibdev_path, "/device");
 	if (ret < 0) {
@@ -385,6 +402,7 @@ static int efa_alloc_fid_nic(struct fi_info *fi, struct efa_context *ctx,
 		ret = -FI_EINVAL;
 		goto err_free_dbdf_sym;
 	}
+#endif // _WIN32
 
 	/* fi_link_attr */
 	src_addr = calloc(1, EFA_EP_ADDR_LEN);
@@ -531,7 +549,7 @@ static int efa_get_device_attrs(struct efa_context *ctx, struct fi_info *info)
 static void efa_addr_to_str(const uint8_t *raw_addr, char *str)
 {
 	size_t name_len = strlen(EFA_FABRIC_PREFIX) + INET6_ADDRSTRLEN;
-	char straddr[INET6_ADDRSTRLEN] = {};
+	char straddr[INET6_ADDRSTRLEN] = {0};
 
 	if (!inet_ntop(AF_INET6, raw_addr, straddr, INET6_ADDRSTRLEN))
 		return;

@@ -83,6 +83,12 @@
 /* sockets provider is built as DSO */
 /* #undef HAVE_SOCKETS_DL */
 
+/* efa provider is built */
+#define HAVE_EFA 1
+
+/* efa provider is built as DSO */
+/* #undef HAVE_EFA_DL */
+
 /* rxm provider is built */
 #define HAVE_RXM 1
 

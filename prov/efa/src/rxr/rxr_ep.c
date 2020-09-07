@@ -56,7 +56,7 @@ static void rxr_ep_print_rts_pkt(struct rxr_ep *ep,
 {
 	char str[RXR_PKT_DUMP_DATA_LEN * 4];
 	size_t str_len = RXR_PKT_DUMP_DATA_LEN * 4, l;
-	uint8_t *src;
+	uint8_t *src = NULL;
 	uint8_t *data;
 	int i;
 
@@ -1143,8 +1143,16 @@ static ssize_t rxr_ep_mr_send_data_pkt_entry(struct rxr_ep *ep,
 	/* The constructed iov to be passed to sendv
 	 * and corresponding fid_mrs
 	 */
+#ifndef _WIN32
 	struct iovec iov[ep->core_iov_limit];
 	void *desc[ep->core_iov_limit];
+#else
+	 /* MSVC compiler does not support array declarations with runtime size, so hardcode
+	  * the expected iov_limit/max_sq_sge from the lower-level efa provider.
+	  */
+	struct iovec iov[EFA_DEV_ATTR_MAX_SQ_SGE];
+	void *desc[EFA_DEV_ATTR_MAX_SQ_SGE];
+#endif
 	/* Constructed iov's total size */
 	uint64_t payload_size = 0;
 	/* pkt_entry offset to write data into */

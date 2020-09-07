@@ -41,7 +41,9 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <errno.h>
+#ifndef _WIN32
 #include <alloca.h>
+#endif
 #include <string.h>
 
 #include "efa_ib.h"

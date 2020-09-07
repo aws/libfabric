@@ -99,13 +99,15 @@ static int efa_cq_create(struct efa_cq *cq, struct efa_context *ctx, unsigned in
 		EFA_WARN(FI_LOG_CQ, "cq spin lock init failed[%d]!\n", err);
 		goto err_destroy_cq;
 	}
-
+	// On windows efa_cmd_create_cq handles memory mapping for application, mmap() unneeded
+#ifndef _WIN32
 	cq->buf = mmap(NULL, cq->buf_size, PROT_WRITE, MAP_SHARED, fd, q_mmap_key);
 	if (cq->buf == MAP_FAILED) {
 		EFA_WARN(FI_LOG_CQ, "cq buffer mmap failed[%d]!\n", errno);
 		err = -EINVAL;
 		goto err_destroy_lock;
 	}
+#endif //!_WIN32
 
 	cq->sub_cq_arr = calloc(num_sub_cqs, sizeof(*cq->sub_cq_arr));
 	if (!cq->sub_cq_arr) {
@@ -125,7 +127,10 @@ static int efa_cq_create(struct efa_cq *cq, struct efa_context *ctx, unsigned in
 	return 0;
 
 err_unmap_buf:
+// Windows does not use mmap, thus does not need to munmap
+#ifndef _WIN32
 	munmap(cq->buf, cq->buf_size);
+#endif //!_WIN32
 err_destroy_lock:
 	fastlock_destroy(&cq->inner_lock);
 err_destroy_cq:
@@ -142,8 +147,11 @@ static int efa_cq_destroy(struct efa_cq *cq)
 	pthread_mutex_lock(&cq->domain->ctx->ibv_ctx.mutex);
 
 	free(cq->sub_cq_arr);
+	// Windows does not use mmap, thus does not need to munmap
+#ifndef _WIN32
 	if (munmap(cq->buf, cq->buf_size))
 		EFA_WARN(FI_LOG_CQ, "cq[%u]: buffer unmap failed!\n", cq->cqn);
+#endif //!_WIN32
 
 	fastlock_destroy(&cq->inner_lock);
 	err = efa_cmd_destroy_cq(cq);
