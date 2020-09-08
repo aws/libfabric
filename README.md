@@ -2,6 +2,12 @@
 [<img alt="libfabric Coverity scan suild status" src="https://scan.coverity.com/projects/4274/badge.svg"/>](https://scan.coverity.com/projects/4274)
 [![libfabric release version](https://img.shields.io/github/release/ofiwg/libfabric.svg)](https://github.com/ofiwg/libfabric/releases/latest)
 
+# Windows EFA
+
+This is a fork of libfabric v1.9.x focused on providing support for Windows EFA within AWS datacenters. For users who
+were not directed to this fork and are not looking for windows EFA support the
+[the official libfabric repository](https://github.com/ofiwg/libfabric) is recommended.
+
 # libfabric
 
 The Open Fabrics Interfaces (OFI) is a framework focused on exporting fabric
