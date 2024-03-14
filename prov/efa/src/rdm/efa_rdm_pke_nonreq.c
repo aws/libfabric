@@ -647,6 +647,14 @@ void efa_rdm_pke_handle_eor_recv(struct efa_rdm_pke *pkt_entry)
 	assert(peer);
 	peer->num_read_msg_in_flight -= 1;
 
+	struct efa_hmem_info *hmem_info;
+	int iface;
+
+	hmem_info = efa_rdm_ep_domain(pkt_entry->ep)->hmem_info;
+	iface = pkt_entry->ope->desc[0] ? ((struct efa_mr*) pkt_entry->ope->desc[0])->peer.iface : FI_HMEM_SYSTEM;
+	//do I now need to synchronize access to this?
+	hmem_info[iface].num_read_msg_in_flight -= 1;
+
 	eor_hdr = (struct efa_rdm_eor_hdr *)pkt_entry->wiredata;
 
 	/* pre-post buf used here, so can NOT track back to txe with x_entry */
@@ -674,6 +682,14 @@ void efa_rdm_pke_handle_read_nack_recv(struct efa_rdm_pke *pkt_entry)
 	peer = efa_rdm_ep_get_peer(pkt_entry->ep, pkt_entry->addr);
 	assert(peer);
 	peer->num_read_msg_in_flight -= 1;
+
+	struct efa_hmem_info *hmem_info;
+	int iface;
+
+	hmem_info = efa_rdm_ep_domain(pkt_entry->ep)->hmem_info;
+	iface = pkt_entry->ope->desc[0] ? ((struct efa_mr*) pkt_entry->ope->desc[0])->peer.iface : FI_HMEM_SYSTEM;
+	//do I now need to synchronize access to this?
+	hmem_info[iface].num_read_msg_in_flight -= 1;
 
 	nack_hdr = (struct efa_rdm_read_nack_hdr *) pkt_entry->wiredata;
 

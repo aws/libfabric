@@ -61,6 +61,13 @@ struct efa_hmem_info {
 	size_t runt_size;
 	size_t min_read_msg_size;
 	size_t min_read_write_size;
+
+	/**
+	 * @brief number of messages that are using read based protocol. used as a semaphore for creating runts. do we need to synchronize access to this? use an actual semaphore?
+	 * need to init this somewhere!!!!!
+	 */
+	int64_t num_read_msg_in_flight;
+
 };
 
 struct efa_domain;

@@ -302,7 +302,16 @@ int efa_rdm_peer_select_readbase_rtm(struct efa_rdm_peer *peer,
 	int op = ope->op;
 
 	assert(op == ofi_op_tagged || op == ofi_op_msg);
-	if (peer->num_read_msg_in_flight == 0 &&
+
+	struct efa_hmem_info *hmem_info;
+	int iface;
+
+	hmem_info = efa_rdm_ep_domain(ep)->hmem_info;
+	iface = ope->desc[0] ? ((struct efa_mr*) ope->desc[0])->peer.iface : FI_HMEM_SYSTEM;
+	//do I now need to synchronize access to this?
+
+
+	if (peer->num_read_msg_in_flight == 0 && hmem_info[iface].num_read_msg_in_flight == 0 &&
 	    efa_rdm_peer_get_runt_size(peer, ep, ope) > 0 &&
 	    !(ope->fi_flags & FI_DELIVERY_COMPLETE)) {
 		return (op == ofi_op_tagged) ? EFA_RDM_RUNTREAD_TAGRTM_PKT

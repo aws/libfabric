@@ -1208,6 +1208,15 @@ void efa_rdm_pke_handle_longread_rtm_sent(struct efa_rdm_pke *pkt_entry)
 	peer = efa_rdm_ep_get_peer(pkt_entry->ep, pkt_entry->addr);
 	assert(peer);
 	peer->num_read_msg_in_flight += 1;
+
+	struct efa_hmem_info *hmem_info;
+	int iface;
+
+	hmem_info = efa_rdm_ep_domain(pkt_entry->ep)->hmem_info;
+	iface = pkt_entry->ope->desc[0] ? ((struct efa_mr*) pkt_entry->ope->desc[0])->peer.iface : FI_HMEM_SYSTEM;
+	//do I now need to synchronize access to this?
+	hmem_info[iface]->num_read_msg_in_flight += 1;
+
 }
 
 /**
@@ -1387,8 +1396,16 @@ void efa_rdm_pke_handle_runtread_rtm_sent(struct efa_rdm_pke *pkt_entry)
 	peer->num_runt_bytes_in_flight += pkt_data_size;
 
 	if (efa_rdm_pke_get_runtread_rtm_base_hdr(pkt_entry)->seg_offset == 0 &&
-	    txe->total_len > txe->bytes_runt)
+	    txe->total_len > txe->bytes_runt) {
 		peer->num_read_msg_in_flight += 1;
+			struct efa_hmem_info *hmem_info;
+			int iface;
+
+			hmem_info = efa_rdm_ep_domain(pkt_entry->ep)->hmem_info;
+			iface = pkt_entry->ope->desc[0] ? ((struct efa_mr*) pkt_entry->ope->desc[0])->peer.iface : FI_HMEM_SYSTEM;
+			//do I now need to synchronize access to this?
+			hmem_info[iface]->num_read_msg_in_flight += 1;
+	    }
 }
 
 /**

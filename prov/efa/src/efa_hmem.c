@@ -277,6 +277,7 @@ static int efa_domain_hmem_info_init_neuron(struct efa_domain *efa_domain)
 	info->p2p_disabled_by_user = false;
 	/* Neuron currently requires P2P */
 	info->p2p_required_by_impl = true;
+	info->num_read_msg_in_flight = 0;
 
 #if HAVE_EFA_DMABUF_MR
 	ret = neuron_get_dmabuf_fd(ptr, (uint64_t)len, &dmabuf_fd, &offset);
