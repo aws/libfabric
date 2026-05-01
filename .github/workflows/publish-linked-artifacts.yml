@@ -1,0 +1,87 @@
+name: Publish linked artifacts
+
+on:
+  release:
+    types:
+    - published
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-linked-artifacts-${{ github.event.release.id }}
+  cancel-in-progress: false
+
+jobs:
+  publish-linked-artifacts:
+    if: ${{ github.event.repository.owner.type == 'Organization' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      artifact-metadata: write
+    steps:
+    - name: Upload linked artifact storage records
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        set -euo pipefail
+        TAG="${{ github.event.release.tag_name }}"
+        VERSION="${TAG#v}"
+        SUMMARY=""
+
+        mapfile -t ASSETS < <(jq -r '.release.assets[]? | select(.name | test("\\.tar\\.(gz|bz2)$")) | .name' "$GITHUB_EVENT_PATH")
+        if [ "${#ASSETS[@]}" -eq 0 ]; then
+          echo "No release tarball assets found for $TAG; nothing to publish."
+          exit 0
+        fi
+
+        mkdir -p release-artifacts
+        RELEASE_JSON=$(gh api "repos/${{ github.repository }}/releases/tags/${TAG}")
+
+        for name in "${ASSETS[@]}"; do
+          gh release download "$TAG" --repo "${{ github.repository }}" --pattern "$name" --dir release-artifacts --clobber
+          artifact="release-artifacts/$name"
+          if [ ! -f "$artifact" ]; then
+            echo "::error title=Missing downloaded asset::Expected $artifact to exist after download."
+            exit 1
+          fi
+
+          digest="sha256:$(sha256sum "$artifact" | awk '{print $1}')"
+          asset_url=$(printf '%s\n' "$RELEASE_JSON" | jq -r --arg name "$name" '.assets[] | select(.name == $name) | .browser_download_url')
+          if [ -z "$asset_url" ] || [ "$asset_url" = "null" ]; then
+            echo "::error title=Missing release asset URL::Could not find browser_download_url for $name"
+            exit 1
+          fi
+
+          jq -n \
+            --arg name "$name" \
+            --arg digest "$digest" \
+            --arg version "$VERSION" \
+            --arg artifact_url "$asset_url" \
+            --arg registry_url "https://github.com" \
+            --arg repository "${{ github.repository }}" \
+            --arg status "active" \
+            '{
+              name: $name,
+              digest: $digest,
+              version: $version,
+              artifact_url: $artifact_url,
+              registry_url: $registry_url,
+              repository: $repository,
+              status: $status
+            }' > storage-record.json
+
+          gh api -X POST "orgs/${{ github.repository_owner }}/artifacts/metadata/storage-record" --input storage-record.json >/dev/null
+          echo "::notice title=Linked artifact uploaded::$name ($digest)"
+          SUMMARY="${SUMMARY}\n| ${name} | ${digest} |"
+        done
+
+        {
+          echo "## Linked Artifacts Published"
+          echo "- **Tag**: ${TAG}"
+          echo "- **Version**: ${VERSION}"
+          echo ""
+          echo "| Artifact | Digest |"
+          echo "|---|---|"
+          echo -e "$SUMMARY"
+        } >> "$GITHUB_STEP_SUMMARY"
