@@ -27,14 +27,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - name: Render invocation summary
+      env:
+        UPSTREAM_REPO: ${{ inputs.upstream_repo }}
+        INPUT_REF: ${{ inputs.ref }}
+        VERSION_OVERRIDE: ${{ inputs.version_override }}
+        SERVER_URL: ${{ github.server_url }}
       run: |
         {
           echo "| Input | Value |"
           echo "|---|---|"
-          echo "| Upstream repo | [\`${{ inputs.upstream_repo }}\`](${{ github.server_url }}/${{ inputs.upstream_repo }}) |"
-          echo "| Upstream ref | [\`${{ inputs.ref }}\`](${{ github.server_url }}/${{ inputs.upstream_repo }}/tree/${{ inputs.ref }}) |"
-          if [ -n "${{ inputs.version_override }}" ]; then
-            echo "| Version override | \`${{ inputs.version_override }}\` |"
+          echo "| Upstream repo | [\`${UPSTREAM_REPO}\`](${SERVER_URL}/${UPSTREAM_REPO}) |"
+          echo "| Upstream ref | [\`${INPUT_REF}\`](${SERVER_URL}/${UPSTREAM_REPO}/tree/${INPUT_REF}) |"
+          if [ -n "${VERSION_OVERRIDE}" ]; then
+            echo "| Version override | \`${VERSION_OVERRIDE}\` |"
           fi
         } >> "$GITHUB_STEP_SUMMARY"
 
@@ -55,46 +60,55 @@ jobs:
       build_branch: ${{ steps.build_ref.outputs.branch }}
     steps:
     - name: Checkout release tooling
-      uses: actions/checkout@v6
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
         persist-credentials: false
 
     - name: Validate upstream repo
       if: ${{ inputs.upstream_repo != 'ofiwg/libfabric' }}
+      env:
+        UPSTREAM_REPO: ${{ inputs.upstream_repo }}
       run: |
-        echo "::warning title=Non-default upstream repo::Using '${{ inputs.upstream_repo }}' instead of 'ofiwg/libfabric'"
+        echo "::warning title=Non-default upstream repo::Using '${UPSTREAM_REPO}' instead of 'ofiwg/libfabric'"
 
     - name: Validate version override
       if: ${{ inputs.version_override != '' }}
+      env:
+        VERSION_OVERRIDE: ${{ inputs.version_override }}
       run: |
-        VERSION="${{ inputs.version_override }}"
-        if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+amzn[0-9]+\.[0-9]+$'; then
-          echo "::error title=Invalid version override::Version '$VERSION' does not match expected format 'X.Y.ZamznN.N' (e.g., '2.4.0amzn1.0')"
+        if ! echo "${VERSION_OVERRIDE}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+amzn[0-9]+\.[0-9]+$'; then
+          echo "::error title=Invalid version override::Version '${VERSION_OVERRIDE}' does not match expected format 'X.Y.ZamznN.N' (e.g., '2.4.0amzn1.0')"
           exit 1
         fi
-        echo "::warning title=Manual version override::Using operator-provided version '$VERSION' instead of automatic derivation. Automatic ref validation is bypassed."
+        echo "::warning title=Manual version override::Using operator-provided version '${VERSION_OVERRIDE}' instead of automatic derivation. Automatic ref validation is bypassed."
 
     - name: Checkout upstream source
       id: upstream
+      env:
+        UPSTREAM_REPO: ${{ inputs.upstream_repo }}
+        INPUT_REF: ${{ inputs.ref }}
       run: |
-        echo "::debug::Cloning ${{ inputs.upstream_repo }} and checking out ${{ inputs.ref }}"
-        git clone --no-checkout "https://github.com/${{ inputs.upstream_repo }}.git" source
+        echo "::debug::Cloning ${UPSTREAM_REPO} and checking out ${INPUT_REF}"
+        git clone --no-checkout "https://github.com/${UPSTREAM_REPO}.git" source
         cd source
-        git checkout "${{ inputs.ref }}"
+        git checkout "${INPUT_REF}"
         echo "::debug::Checked out $(git rev-parse HEAD)"
         echo "upstream_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
         echo "upstream_sha_short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
 
     - name: Derive release version
       id: version
+      env:
+        VERSION_OVERRIDE: ${{ inputs.version_override }}
+        INPUT_REF: ${{ inputs.ref }}
+        AWS_LIBFABRIC_REPO: https://github.com/${{ github.repository }}.git
+        UPSTREAM_LIBFABRIC_REPO: https://github.com/${{ inputs.upstream_repo }}.git
       run: |
-        if [ -n "${{ inputs.version_override }}" ]; then
-          RELEASE_VERSION="${{ inputs.version_override }}"
+        if [ -n "${VERSION_OVERRIDE}" ]; then
+          RELEASE_VERSION="${VERSION_OVERRIDE}"
         else
           cd source
-          export AWS_LIBFABRIC_REPO="https://github.com/${{ github.repository }}.git"
-          export UPSTREAM_LIBFABRIC_REPO="https://github.com/${{ inputs.upstream_repo }}.git"
-          RELEASE_VERSION=$(bash "$GITHUB_WORKSPACE/.github/scripts/derive-release-version.sh" "${{ inputs.ref }}" | awk '{print $NF}')
+          RELEASE_VERSION=$(bash "$GITHUB_WORKSPACE/.github/scripts/derive-release-version.sh" "${INPUT_REF}" | awk '{print $NF}')
           cd ..
         fi
         TAG="v${RELEASE_VERSION}"
@@ -105,61 +119,72 @@ jobs:
     - name: Check tag does not exist
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        REPO: ${{ github.repository }}
+        TAG: ${{ steps.version.outputs.tag }}
       run: |
-        REMOTE="https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
-        if git ls-remote --tags "${REMOTE}" "${{ steps.version.outputs.tag }}" | grep -q .; then
-          echo "::error title=Tag already exists::Tag ${{ steps.version.outputs.tag }} already exists in ${{ github.repository }}"
+        REMOTE="https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
+        if git ls-remote --tags "${REMOTE}" "${TAG}" | grep -q .; then
+          echo "::error title=Tag already exists::Tag ${TAG} already exists in ${REPO}"
           exit 1
         fi
 
     - name: Patch version
+      env:
+        RELEASE_VERSION: ${{ steps.version.outputs.version }}
       run: |
         cd source
-        echo "::debug::Patching configure.ac with version ${{ steps.version.outputs.version }}"
-        sed -i 's/AC_INIT(\[libfabric\], \[[^]]*\], \[[^]]*\])/AC_INIT([libfabric], [${{ steps.version.outputs.version }}], [ec2-efa-maintainers@amazon.com])/' configure.ac
+        echo "::debug::Patching configure.ac with version ${RELEASE_VERSION}"
+        sed -i "s/AC_INIT(\[libfabric\], \[[^]]*\], \[[^]]*\])/AC_INIT([libfabric], [${RELEASE_VERSION}], [ec2-efa-maintainers@amazon.com])/" configure.ac
 
     - name: Verify version patch
+      env:
+        RELEASE_VERSION: ${{ steps.version.outputs.version }}
       run: |
         cd source
         PATCHED=$(grep 'AC_INIT' configure.ac)
-        if ! echo "$PATCHED" | grep -q '${{ steps.version.outputs.version }}'; then
-          echo "::error title=Version patch failed::configure.ac does not contain expected version ${{ steps.version.outputs.version }}. Found: ${PATCHED}"
+        if ! echo "${PATCHED}" | grep -q "${RELEASE_VERSION}"; then
+          echo "::error title=Version patch failed::configure.ac does not contain expected version ${RELEASE_VERSION}. Found: ${PATCHED}"
           exit 1
         fi
 
     - name: Commit version patch for dist build
       id: release_commit
+      env:
+        RELEASE_VERSION: ${{ steps.version.outputs.version }}
       run: |
         cd source
         git config user.name "github-actions[bot]"
         git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
         git add configure.ac
-        git commit -m "v${{ steps.version.outputs.version }}"
+        git commit -m "v${RELEASE_VERSION}"
         echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
     - name: Check version reservation
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        REPO: ${{ github.repository }}
+        RELEASE_VERSION: ${{ steps.version.outputs.version }}
       run: |
-        VERSION="${{ steps.version.outputs.version }}"
-        REMOTE="https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
-
-        EXISTING=$(git ls-remote --heads "${REMOTE}" "ci/aws-release-build/${VERSION}-*")
-        if [ -n "$EXISTING" ]; then
-          echo "::error title=Version already reserved::Version ${VERSION} is being processed by another workflow run."
+        REMOTE="https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
+        EXISTING=$(git ls-remote --heads "${REMOTE}" "ci/aws-release-build/${RELEASE_VERSION}-*")
+        if [ -n "${EXISTING}" ]; then
+          echo "::error title=Version already reserved::Version ${RELEASE_VERSION} is being processed by another workflow run."
           echo "Existing reservation(s):"
-          echo "$EXISTING"
+          echo "${EXISTING}"
           exit 1
         fi
-        echo "No existing reservation for ${VERSION}. Proceeding."
+        echo "No existing reservation for ${RELEASE_VERSION}. Proceeding."
 
     - name: Push temporary build branch
       id: build_ref
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        REPO: ${{ github.repository }}
+        RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        RUN_ID: ${{ github.run_id }}
       run: |
-        BRANCH="ci/aws-release-build/${{ steps.version.outputs.version }}-${{ github.run_id }}"
-        REMOTE="https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+        BRANCH="ci/aws-release-build/${RELEASE_VERSION}-${RUN_ID}"
+        REMOTE="https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
         cd source
         git push --force "${REMOTE}" "HEAD:refs/heads/${BRANCH}"
         echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
@@ -175,10 +200,11 @@ jobs:
       tag: ${{ steps.version.outputs.tag }}
     steps:
     - name: Checkout source from temporary build branch
-      uses: actions/checkout@v6
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
         ref: ${{ needs.prepare-source.outputs.build_ref }}
         fetch-depth: 0
+        persist-credentials: false
 
     - name: Resolve version
       id: version
@@ -205,7 +231,7 @@ jobs:
         cp libfabric-*.tar.* release-artifacts/
 
     - name: Upload release artifacts
-      uses: actions/upload-artifact@v7
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       with:
         name: release-artifacts
         path: release-artifacts/*
@@ -218,24 +244,29 @@ jobs:
       prev_tag: ${{ steps.prev.outputs.tag }}
     steps:
     - name: Checkout release tooling
-      uses: actions/checkout@v6
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
         persist-credentials: false
 
     - name: Download release artifacts
-      uses: actions/download-artifact@v8
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
       with:
         name: release-artifacts
         path: release-artifacts
 
     - name: Validate build metadata
+      env:
+        PREP_VERSION: ${{ needs.prepare-source.outputs.version }}
+        BUILD_VERSION: ${{ needs.build-artifacts.outputs.version }}
+        PREP_TAG: ${{ needs.prepare-source.outputs.tag }}
+        BUILD_TAG: ${{ needs.build-artifacts.outputs.tag }}
       run: |
-        if [ "${{ needs.prepare-source.outputs.version }}" != "${{ needs.build-artifacts.outputs.version }}" ]; then
-          echo "::error title=Version mismatch::prepare-source=${{ needs.prepare-source.outputs.version }} build-artifacts=${{ needs.build-artifacts.outputs.version }}"
+        if [ "${PREP_VERSION}" != "${BUILD_VERSION}" ]; then
+          echo "::error title=Version mismatch::prepare-source=${PREP_VERSION} build-artifacts=${BUILD_VERSION}"
           exit 1
         fi
-        if [ "${{ needs.prepare-source.outputs.tag }}" != "${{ needs.build-artifacts.outputs.tag }}" ]; then
-          echo "::error title=Tag mismatch::prepare-source=${{ needs.prepare-source.outputs.tag }} build-artifacts=${{ needs.build-artifacts.outputs.tag }}"
+        if [ "${PREP_TAG}" != "${BUILD_TAG}" ]; then
+          echo "::error title=Tag mismatch::prepare-source=${PREP_TAG} build-artifacts=${BUILD_TAG}"
           exit 1
         fi
 
@@ -243,8 +274,9 @@ jobs:
       id: prev
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        REPO: ${{ github.repository }}
       run: |
-        PREV_TAG=$(gh api "repos/${{ github.repository }}/releases" --paginate \
+        PREV_TAG=$(gh api "repos/${REPO}/releases" --paginate \
           -q '[.[] | select(.draft == false and .prerelease == false) | .tag_name] | .[]' \
           | grep -E '^v[0-9].*amzn[0-9]+\.[0-9]+$' \
           | sort -V \
@@ -260,17 +292,22 @@ jobs:
         SERVER_URL: ${{ github.server_url }}
         PREV_TAG: ${{ steps.prev.outputs.tag }}
         CURRENT_TAG: ${{ needs.build-artifacts.outputs.tag }}
+        RELEASE_COMMIT_SHA: ${{ needs.prepare-source.outputs.release_commit_sha }}
         BUILD_ATTESTATION_URL: "[link generated at publish time]"
         SOURCE_BINDING_ATTESTATION_URL: "[link generated at publish time]"
       run: |
         BODY=$(bash "$GITHUB_WORKSPACE/.github/scripts/render-release-body.sh")
+        PREV_LINK="(none)"
+        if [ -n "${PREV_TAG}" ]; then
+          PREV_LINK="[${PREV_TAG}](${SERVER_URL}/${RELEASE_REPO}/releases/tag/${PREV_TAG})"
+        fi
         {
           echo "## Release Preview"
-          echo "- Version: ${{ needs.build-artifacts.outputs.version }}"
-          echo "- Tag: \`${{ needs.build-artifacts.outputs.tag }}\`"
-          echo "- Upstream ref: ${{ inputs.upstream_repo }}@${{ needs.prepare-source.outputs.upstream_sha }}"
-          echo "- Release commit: ${{ github.repository }}@${{ needs.prepare-source.outputs.release_commit_sha }}"
-          echo "- Previous release: ${{ steps.prev.outputs.tag && format('[{0}]({1}/{2}/releases/tag/{3})', steps.prev.outputs.tag, github.server_url, github.repository, steps.prev.outputs.tag) || '(none)' }}"
+          echo "- Version: ${RELEASE_VERSION}"
+          echo "- Tag: \`${CURRENT_TAG}\`"
+          echo "- Upstream ref: ${UPSTREAM_REPO}@${UPSTREAM_SHA}"
+          echo "- Release commit: ${RELEASE_REPO}@${RELEASE_COMMIT_SHA}"
+          echo "- Previous release: ${PREV_LINK}"
           echo ""
           echo "### Artifacts"
           echo ""
@@ -280,7 +317,7 @@ jobs:
           echo ""
           echo "<details><summary>Release notes preview</summary>"
           echo ""
-          echo "$BODY"
+          echo "${BODY}"
           echo ""
           echo "</details>"
           echo ""
@@ -299,12 +336,12 @@ jobs:
       attestations: write
     steps:
     - name: Checkout release tooling
-      uses: actions/checkout@v6
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
         persist-credentials: false
 
     - name: Download release artifacts
-      uses: actions/download-artifact@v8
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
       with:
         name: release-artifacts
         path: release-artifacts
@@ -312,22 +349,26 @@ jobs:
     - name: Re-check tag does not exist
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        REPO: ${{ github.repository }}
+        TAG: ${{ needs.build-artifacts.outputs.tag }}
       run: |
-        REMOTE="https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
-        if git ls-remote --tags "${REMOTE}" "${{ needs.build-artifacts.outputs.tag }}" | grep -q .; then
-          echo "::error title=Tag already exists::Tag ${{ needs.build-artifacts.outputs.tag }} already exists in ${{ github.repository }}"
+        REMOTE="https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
+        if git ls-remote --tags "${REMOTE}" "${TAG}" | grep -q .; then
+          echo "::error title=Tag already exists::Tag ${TAG} already exists in ${REPO}"
           exit 1
         fi
 
     - name: Push tag
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        REPO: ${{ github.repository }}
+        BUILD_BRANCH: ${{ needs.prepare-source.outputs.build_branch }}
+        RELEASE_SHA: ${{ needs.prepare-source.outputs.release_commit_sha }}
+        TAG: ${{ needs.build-artifacts.outputs.tag }}
+        RELEASE_VERSION: ${{ needs.build-artifacts.outputs.version }}
       run: |
         set -euo pipefail
-        REPO_URL="https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
-        REMOTE_PUSH="${REPO_URL}"
-        BUILD_BRANCH="${{ needs.prepare-source.outputs.build_branch }}"
-        RELEASE_SHA="${{ needs.prepare-source.outputs.release_commit_sha }}"
+        REPO_URL="https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
 
         git init source
         cd source
@@ -337,11 +378,10 @@ jobs:
         git config user.name "github-actions[bot]"
         git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-        git tag -a "${{ needs.build-artifacts.outputs.tag }}" \
-          -m "AWS libfabric release ${{ needs.build-artifacts.outputs.version }}"
+        git tag -a "${TAG}" -m "AWS libfabric release ${RELEASE_VERSION}"
 
-        echo "::debug::Pushing tag ${{ needs.build-artifacts.outputs.tag }} to ${{ github.repository }}"
-        git push "${REMOTE_PUSH}" "refs/tags/${{ needs.build-artifacts.outputs.tag }}"
+        echo "::debug::Pushing tag ${TAG} to ${REPO}"
+        git push "${REPO_URL}" "refs/tags/${TAG}"
 
     - name: Attest release artifacts
       id: attest
@@ -350,24 +390,33 @@ jobs:
         subject-path: 'release-artifacts/*.tar.*'
 
     - name: Generate source binding predicate
+      env:
+        UPSTREAM_REPO: ${{ inputs.upstream_repo }}
+        INPUT_REF: ${{ inputs.ref }}
+        UPSTREAM_SHA: ${{ needs.prepare-source.outputs.upstream_sha }}
+        RELEASE_REPO: ${{ github.repository }}
+        RELEASE_TAG: ${{ needs.build-artifacts.outputs.tag }}
+        RELEASE_VERSION: ${{ needs.build-artifacts.outputs.version }}
+        RELEASE_COMMIT: ${{ needs.prepare-source.outputs.release_commit_sha }}
+        WORKFLOW_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
       run: |
         CHECKSUMS=$(sha256sum release-artifacts/*.tar.* | sort -k2)
-        ARTIFACTS_JSON=$(printf '%s\n' "$CHECKSUMS" | jq -R -s '
+        ARTIFACTS_JSON=$(printf '%s\n' "${CHECKSUMS}" | jq -R -s '
           split("\n")
           | map(select(length > 0))
           | map(capture("^(?<sha256>[0-9a-f]{64})  (?<path>.+)$"))
           | map({path: .path, sha256: .sha256})
         ')
         jq -n \
-          --arg upstream_repo "${{ inputs.upstream_repo }}" \
-          --arg input_ref "${{ inputs.ref }}" \
-          --arg upstream_sha "${{ needs.prepare-source.outputs.upstream_sha }}" \
-          --arg release_repo "${{ github.repository }}" \
-          --arg release_tag "${{ needs.build-artifacts.outputs.tag }}" \
-          --arg release_version "${{ needs.build-artifacts.outputs.version }}" \
-          --arg release_commit "${{ needs.prepare-source.outputs.release_commit_sha }}" \
-          --arg workflow_run_url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
-          --argjson artifacts "$ARTIFACTS_JSON" \
+          --arg upstream_repo "${UPSTREAM_REPO}" \
+          --arg input_ref "${INPUT_REF}" \
+          --arg upstream_sha "${UPSTREAM_SHA}" \
+          --arg release_repo "${RELEASE_REPO}" \
+          --arg release_tag "${RELEASE_TAG}" \
+          --arg release_version "${RELEASE_VERSION}" \
+          --arg release_commit "${RELEASE_COMMIT}" \
+          --arg workflow_run_url "${WORKFLOW_RUN_URL}" \
+          --argjson artifacts "${ARTIFACTS_JSON}" \
           '{
             source: {
               upstream_repository: $upstream_repo,
@@ -408,7 +457,7 @@ jobs:
         BODY=$(bash "$GITHUB_WORKSPACE/.github/scripts/render-release-body.sh")
         {
           echo "body<<RELEASE_BODY_EOF"
-          echo "$BODY"
+          echo "${BODY}"
           echo "RELEASE_BODY_EOF"
         } >> "$GITHUB_OUTPUT"
 
@@ -426,16 +475,27 @@ jobs:
           release-artifacts/*
 
     - name: Release summary
+      env:
+        RELEASE_VERSION: ${{ needs.build-artifacts.outputs.version }}
+        CURRENT_TAG: ${{ needs.build-artifacts.outputs.tag }}
+        UPSTREAM_REPO: ${{ inputs.upstream_repo }}
+        UPSTREAM_SHA: ${{ needs.prepare-source.outputs.upstream_sha }}
+        RELEASE_REPO: ${{ github.repository }}
+        SERVER_URL: ${{ github.server_url }}
+        RELEASE_COMMIT_SHA: ${{ needs.prepare-source.outputs.release_commit_sha }}
+        ATTEST_URL: ${{ steps.attest.outputs.attestation-url }}
+        SOURCE_BINDING_URL: ${{ steps.source-binding-attest.outputs.attestation-url }}
+        RELEASE_URL: ${{ steps.create-release.outputs.url }}
       run: |
         {
           echo "## Release Summary"
-          echo "- **Version**: ${{ needs.build-artifacts.outputs.version }}"
-          echo "- **Tag**: [\`${{ needs.build-artifacts.outputs.tag }}\`](${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ needs.build-artifacts.outputs.tag }})"
-          echo "- **Upstream ref**: ${{ inputs.upstream_repo }}@${{ needs.prepare-source.outputs.upstream_sha }}"
-          echo "- **Release commit**: ${{ github.repository }}@${{ needs.prepare-source.outputs.release_commit_sha }}"
-          echo "- **Build provenance attestation**: [View](${{ steps.attest.outputs.attestation-url }})"
-          echo "- **Source binding attestation**: [View](${{ steps.source-binding-attest.outputs.attestation-url }})"
-          echo "- **Release**: [View](${{ steps.create-release.outputs.url }})"
+          echo "- **Version**: ${RELEASE_VERSION}"
+          echo "- **Tag**: [\`${CURRENT_TAG}\`](${SERVER_URL}/${RELEASE_REPO}/releases/tag/${CURRENT_TAG})"
+          echo "- **Upstream ref**: ${UPSTREAM_REPO}@${UPSTREAM_SHA}"
+          echo "- **Release commit**: ${RELEASE_REPO}@${RELEASE_COMMIT_SHA}"
+          echo "- **Build provenance attestation**: [View](${ATTEST_URL})"
+          echo "- **Source binding attestation**: [View](${SOURCE_BINDING_URL})"
+          echo "- **Release**: [View](${RELEASE_URL})"
         } >> "$GITHUB_STEP_SUMMARY"
 
   cleanup:
@@ -448,9 +508,11 @@ jobs:
     - name: Delete temporary build branch
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        REPO: ${{ github.repository }}
+        BUILD_BRANCH: ${{ needs.prepare-source.outputs.build_branch }}
       run: |
-        REF="heads/${{ needs.prepare-source.outputs.build_branch }}"
-        ERR=$(gh api -X DELETE "repos/${{ github.repository }}/git/refs/${REF}" 2>&1) && RC=0 || RC=$?
+        REF="heads/${BUILD_BRANCH}"
+        ERR=$(gh api -X DELETE "repos/${REPO}/git/refs/${REF}" 2>&1) && RC=0 || RC=$?
         if [ "${RC}" -eq 0 ]; then
           echo "Deleted temporary build branch ${REF}"
         elif echo "${ERR}" | grep -qiE "reference.*does not exist|not found|422"; then

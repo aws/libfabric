@@ -1,0 +1,7 @@
+rules:
+  superfluous-actions:
+    ignore:
+      # We use softprops/action-gh-release for its asset-upload convenience
+      # (glob patterns, batch uploads). Replacing with `gh release` would
+      # require additional scripting with no material benefit.
+      - release-from-upstream.yml
