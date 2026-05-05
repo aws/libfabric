@@ -58,6 +58,7 @@ jobs:
       release_commit_sha: ${{ steps.release_commit.outputs.sha }}
       build_ref: ${{ steps.build_ref.outputs.ref }}
       build_branch: ${{ steps.build_ref.outputs.branch }}
+      ofiwg_release: ${{ steps.ofiwg_release.outputs.ofiwg_release }}
     steps:
     - name: Checkout release tooling
       uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -96,16 +97,65 @@ jobs:
         echo "upstream_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
         echo "upstream_sha_short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
 
+    - name: Detect OFIWG release build
+      id: ofiwg_release
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        UPSTREAM_REPO: ${{ inputs.upstream_repo }}
+        INPUT_REF: ${{ inputs.ref }}
+        UPSTREAM_SHA: ${{ steps.upstream.outputs.upstream_sha }}
+        VERSION_OVERRIDE: ${{ inputs.version_override }}
+      run: |
+        # OFIWG release build eligibility requires all of:
+        #  - upstream repo is ofiwg/libfabric (other upstreams always get the aws-patched path)
+        #  - no version_override (override implies intentional deviation from upstream)
+        #  - input ref matches exact semver tag pattern (vX.Y.Z, no prerelease suffix)
+        #  - a tag with that name exists upstream and points to the resolved SHA
+        #  - upstream has a published (non-draft, non-prerelease) release at that tag
+        IS_OFIWG_RELEASE=false
+        VERSION=""
+        if [ "${UPSTREAM_REPO}" = "ofiwg/libfabric" ] \
+           && [ -z "${VERSION_OVERRIDE}" ] \
+           && [[ "${INPUT_REF}" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+          CANDIDATE_VERSION="${BASH_REMATCH[1]}"
+          CANDIDATE_TAG="v${CANDIDATE_VERSION}"
+          TAG_REF=$(gh api "repos/${UPSTREAM_REPO}/git/refs/tags/${CANDIDATE_TAG}" 2>/dev/null || true)
+          if [ -n "${TAG_REF}" ]; then
+            TAG_OBJECT_SHA=$(echo "${TAG_REF}" | jq -r '.object.sha')
+            TAG_OBJECT_TYPE=$(echo "${TAG_REF}" | jq -r '.object.type')
+            # Dereference annotated tags to the underlying commit
+            if [ "${TAG_OBJECT_TYPE}" = "tag" ]; then
+              TAG_OBJECT_SHA=$(gh api "repos/${UPSTREAM_REPO}/git/tags/${TAG_OBJECT_SHA}" --jq '.object.sha' 2>/dev/null || true)
+            fi
+            if [ "${TAG_OBJECT_SHA}" = "${UPSTREAM_SHA}" ]; then
+              RELEASE_STATE=$(gh api "repos/${UPSTREAM_REPO}/releases/tags/${CANDIDATE_TAG}" --jq '"draft=\(.draft) prerelease=\(.prerelease)"' 2>/dev/null || true)
+              if [ "${RELEASE_STATE}" = "draft=false prerelease=false" ]; then
+                IS_OFIWG_RELEASE=true
+                VERSION="${CANDIDATE_VERSION}"
+              fi
+            fi
+          fi
+        fi
+        echo "ofiwg_release=${IS_OFIWG_RELEASE}" >> "$GITHUB_OUTPUT"
+        echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+        if [ "${IS_OFIWG_RELEASE}" = "true" ]; then
+          echo "::notice title=OFIWG release build::Ref '${INPUT_REF}' matches published upstream release. Building without configure.ac patching; release tag will be 'v${VERSION}'."
+        fi
+
     - name: Derive release version
       id: version
       env:
         VERSION_OVERRIDE: ${{ inputs.version_override }}
         INPUT_REF: ${{ inputs.ref }}
+        OFIWG_RELEASE: ${{ steps.ofiwg_release.outputs.ofiwg_release }}
+        OFIWG_RELEASE_VERSION: ${{ steps.ofiwg_release.outputs.version }}
         AWS_LIBFABRIC_REPO: https://github.com/${{ github.repository }}.git
         UPSTREAM_LIBFABRIC_REPO: https://github.com/${{ inputs.upstream_repo }}.git
       run: |
         if [ -n "${VERSION_OVERRIDE}" ]; then
           RELEASE_VERSION="${VERSION_OVERRIDE}"
+        elif [ "${OFIWG_RELEASE}" = "true" ]; then
+          RELEASE_VERSION="${OFIWG_RELEASE_VERSION}"
         else
           cd source
           RELEASE_VERSION=$(bash "$GITHUB_WORKSPACE/.github/scripts/derive-release-version.sh" "${INPUT_REF}" | awk '{print $NF}')
@@ -129,6 +179,7 @@ jobs:
         fi
 
     - name: Patch version
+      if: steps.ofiwg_release.outputs.ofiwg_release != 'true'
       env:
         RELEASE_VERSION: ${{ steps.version.outputs.version }}
       run: |
@@ -137,6 +188,7 @@ jobs:
         sed -i "s/AC_INIT(\[libfabric\], \[[^]]*\], \[[^]]*\])/AC_INIT([libfabric], [${RELEASE_VERSION}], [ec2-efa-maintainers@amazon.com])/" configure.ac
 
     - name: Verify version patch
+      if: steps.ofiwg_release.outputs.ofiwg_release != 'true'
       env:
         RELEASE_VERSION: ${{ steps.version.outputs.version }}
       run: |
@@ -147,17 +199,24 @@ jobs:
           exit 1
         fi
 
-    - name: Commit version patch for dist build
+    - name: Record release commit
       id: release_commit
       env:
+        OFIWG_RELEASE: ${{ steps.ofiwg_release.outputs.ofiwg_release }}
         RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        UPSTREAM_SHA: ${{ steps.upstream.outputs.upstream_sha }}
       run: |
         cd source
-        git config user.name "github-actions[bot]"
-        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-        git add configure.ac
-        git commit -m "v${RELEASE_VERSION}"
-        echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+        if [ "${OFIWG_RELEASE}" = "true" ]; then
+          # No patch commit; release commit == upstream commit
+          echo "sha=${UPSTREAM_SHA}" >> "$GITHUB_OUTPUT"
+        else
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add configure.ac
+          git commit -m "v${RELEASE_VERSION}"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+        fi
 
     - name: Check version reservation
       env:
@@ -293,6 +352,8 @@ jobs:
         PREV_TAG: ${{ steps.prev.outputs.tag }}
         CURRENT_TAG: ${{ needs.build-artifacts.outputs.tag }}
         RELEASE_COMMIT_SHA: ${{ needs.prepare-source.outputs.release_commit_sha }}
+        BUILD_TYPE: ${{ needs.prepare-source.outputs.ofiwg_release == 'true' && 'ofiwg-release' || 'aws-patched' }}
+        BUILD_TYPE_LABEL: ${{ needs.prepare-source.outputs.ofiwg_release == 'true' && 'Official OFIWG release' || 'AWS release' }}
         BUILD_ATTESTATION_URL: "[link generated at publish time]"
         SOURCE_BINDING_ATTESTATION_URL: "[link generated at publish time]"
       run: |
@@ -303,6 +364,7 @@ jobs:
         fi
         {
           echo "## Release Preview"
+          echo "- Build type: ${BUILD_TYPE_LABEL}"
           echo "- Version: ${RELEASE_VERSION}"
           echo "- Tag: \`${CURRENT_TAG}\`"
           echo "- Upstream ref: ${UPSTREAM_REPO}@${UPSTREAM_SHA}"
@@ -399,6 +461,7 @@ jobs:
         RELEASE_VERSION: ${{ needs.build-artifacts.outputs.version }}
         RELEASE_COMMIT: ${{ needs.prepare-source.outputs.release_commit_sha }}
         WORKFLOW_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        BUILD_TYPE: ${{ needs.prepare-source.outputs.ofiwg_release == 'true' && 'ofiwg-release' || 'aws-patched' }}
       run: |
         CHECKSUMS=$(sha256sum release-artifacts/*.tar.* | sort -k2)
         ARTIFACTS_JSON=$(printf '%s\n' "${CHECKSUMS}" | jq -R -s '
@@ -416,6 +479,7 @@ jobs:
           --arg release_version "${RELEASE_VERSION}" \
           --arg release_commit "${RELEASE_COMMIT}" \
           --arg workflow_run_url "${WORKFLOW_RUN_URL}" \
+          --arg build_type "${BUILD_TYPE}" \
           --argjson artifacts "${ARTIFACTS_JSON}" \
           '{
             source: {
@@ -428,7 +492,8 @@ jobs:
               version: $release_version,
               tag: $release_tag,
               commit: $release_commit,
-              workflow_run_url: $workflow_run_url
+              workflow_run_url: $workflow_run_url,
+              build_type: $build_type
             },
             artifacts: $artifacts
           }' > source-binding-predicate.json
@@ -451,6 +516,7 @@ jobs:
         SERVER_URL: ${{ github.server_url }}
         PREV_TAG: ${{ needs.preview.outputs.prev_tag }}
         CURRENT_TAG: ${{ needs.build-artifacts.outputs.tag }}
+        BUILD_TYPE: ${{ needs.prepare-source.outputs.ofiwg_release == 'true' && 'ofiwg-release' || 'aws-patched' }}
         BUILD_ATTESTATION_URL: ${{ steps.attest.outputs.attestation-url }}
         SOURCE_BINDING_ATTESTATION_URL: ${{ steps.source-binding-attest.outputs.attestation-url }}
       run: |
@@ -483,12 +549,14 @@ jobs:
         RELEASE_REPO: ${{ github.repository }}
         SERVER_URL: ${{ github.server_url }}
         RELEASE_COMMIT_SHA: ${{ needs.prepare-source.outputs.release_commit_sha }}
+        BUILD_TYPE_LABEL: ${{ needs.prepare-source.outputs.ofiwg_release == 'true' && 'Official OFIWG release' || 'AWS release' }}
         ATTEST_URL: ${{ steps.attest.outputs.attestation-url }}
         SOURCE_BINDING_URL: ${{ steps.source-binding-attest.outputs.attestation-url }}
         RELEASE_URL: ${{ steps.create-release.outputs.url }}
       run: |
         {
           echo "## Release Summary"
+          echo "- **Build type**: ${BUILD_TYPE_LABEL}"
           echo "- **Version**: ${RELEASE_VERSION}"
           echo "- **Tag**: [\`${CURRENT_TAG}\`](${SERVER_URL}/${RELEASE_REPO}/releases/tag/${CURRENT_TAG})"
           echo "- **Upstream ref**: ${UPSTREAM_REPO}@${UPSTREAM_SHA}"
