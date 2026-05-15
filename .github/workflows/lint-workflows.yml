@@ -5,12 +5,14 @@ on:
     paths:
       - '.github/workflows/**'
       - '.github/scripts/**'
+      - '.github/dependabot.yml'
   push:
     branches:
       - actions
     paths:
       - '.github/workflows/**'
       - '.github/scripts/**'
+      - '.github/dependabot.yml'
 
 permissions: {}
 
