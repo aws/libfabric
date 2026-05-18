@@ -1,6 +1,6 @@
 name: Release from upstream
 
-run-name: Release based on ${{ inputs.upstream_repo == 'ofiwg/libfabric' && 'ofiwg' || inputs.upstream_repo }}@${{ inputs.ref }}
+run-name: Release ${{ inputs.version }} from ${{ inputs.upstream_repo == 'ofiwg/libfabric' && 'ofiwg' || inputs.upstream_repo }}@${{ inputs.ref }}
 
 on:
   workflow_dispatch:
@@ -14,9 +14,9 @@ on:
         description: 'Git ref to release from (branch, tag, or SHA)'
         required: true
         type: string
-      version_override:
-        description: 'Override version (e.g. 2.5.0amzn1.0). If empty, derived automatically from ref.'
-        required: false
+      version:
+        description: 'Release version (e.g. 2.5.0amzn1.0)'
+        required: true
         type: string
 
 permissions:
@@ -30,7 +30,7 @@ jobs:
       env:
         UPSTREAM_REPO: ${{ inputs.upstream_repo }}
         INPUT_REF: ${{ inputs.ref }}
-        VERSION_OVERRIDE: ${{ inputs.version_override }}
+        VERSION: ${{ inputs.version }}
         SERVER_URL: ${{ github.server_url }}
       run: |
         {
@@ -38,9 +38,7 @@ jobs:
           echo "|---|---|"
           echo "| Upstream repo | [\`${UPSTREAM_REPO}\`](${SERVER_URL}/${UPSTREAM_REPO}) |"
           echo "| Upstream ref | [\`${INPUT_REF}\`](${SERVER_URL}/${UPSTREAM_REPO}/tree/${INPUT_REF}) |"
-          if [ -n "${VERSION_OVERRIDE}" ]; then
-            echo "| Version override | \`${VERSION_OVERRIDE}\` |"
-          fi
+          echo "| Version | \`${VERSION}\` |"
         } >> "$GITHUB_STEP_SUMMARY"
 
   prepare-source:
@@ -72,16 +70,14 @@ jobs:
       run: |
         echo "::warning title=Non-default upstream repo::Using '${UPSTREAM_REPO}' instead of 'ofiwg/libfabric'"
 
-    - name: Validate version override
-      if: ${{ inputs.version_override != '' }}
+    - name: Validate version
       env:
-        VERSION_OVERRIDE: ${{ inputs.version_override }}
+        VERSION: ${{ inputs.version }}
       run: |
-        if ! echo "${VERSION_OVERRIDE}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+amzn[0-9]+\.[0-9]+$'; then
-          echo "::error title=Invalid version override::Version '${VERSION_OVERRIDE}' does not match expected format 'X.Y.ZamznN.N' (e.g., '2.4.0amzn1.0')"
+        if ! echo "${VERSION}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(amzn[0-9]+\.[0-9]+)?$'; then
+          echo "::error title=Invalid version::Version '${VERSION}' does not match expected format. Use 'X.Y.ZamznN.N' (e.g., '2.4.0amzn1.0') for AWS releases or 'X.Y.Z' (e.g., '2.4.0') for OFIWG passthrough releases."
           exit 1
         fi
-        echo "::warning title=Manual version override::Using operator-provided version '${VERSION_OVERRIDE}' instead of automatic derivation. Automatic ref validation is bypassed."
 
     - name: Checkout upstream source
       id: upstream
@@ -104,18 +100,18 @@ jobs:
         UPSTREAM_REPO: ${{ inputs.upstream_repo }}
         INPUT_REF: ${{ inputs.ref }}
         UPSTREAM_SHA: ${{ steps.upstream.outputs.upstream_sha }}
-        VERSION_OVERRIDE: ${{ inputs.version_override }}
+        VERSION: ${{ inputs.version }}
       run: |
         # OFIWG release build eligibility requires all of:
         #  - upstream repo is ofiwg/libfabric (other upstreams always get the aws-patched path)
-        #  - no version_override (override implies intentional deviation from upstream)
+        #  - version has no amzn suffix (pure upstream version implies passthrough)
         #  - input ref matches exact semver tag pattern (vX.Y.Z, no prerelease suffix)
         #  - a tag with that name exists upstream and points to the resolved SHA
         #  - upstream has a published (non-draft, non-prerelease) release at that tag
         IS_OFIWG_RELEASE=false
         VERSION=""
         if [ "${UPSTREAM_REPO}" = "ofiwg/libfabric" ] \
-           && [ -z "${VERSION_OVERRIDE}" ] \
+           && ! echo "${VERSION}" | grep -q "amzn" \
            && [[ "${INPUT_REF}" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
           CANDIDATE_VERSION="${BASH_REMATCH[1]}"
           CANDIDATE_TAG="v${CANDIDATE_VERSION}"
@@ -145,24 +141,33 @@ jobs:
     - name: Derive release version
       id: version
       env:
-        VERSION_OVERRIDE: ${{ inputs.version_override }}
+        VERSION: ${{ inputs.version }}
         INPUT_REF: ${{ inputs.ref }}
         OFIWG_RELEASE: ${{ steps.ofiwg_release.outputs.ofiwg_release }}
         OFIWG_RELEASE_VERSION: ${{ steps.ofiwg_release.outputs.version }}
         AWS_LIBFABRIC_REPO: https://github.com/${{ github.repository }}.git
         UPSTREAM_LIBFABRIC_REPO: https://github.com/${{ inputs.upstream_repo }}.git
       run: |
-        if [ -n "${VERSION_OVERRIDE}" ]; then
-          RELEASE_VERSION="${VERSION_OVERRIDE}"
-        elif [ "${OFIWG_RELEASE}" = "true" ]; then
-          RELEASE_VERSION="${OFIWG_RELEASE_VERSION}"
+        RELEASE_VERSION="${VERSION}"
+        TAG="v${RELEASE_VERSION}"
+
+        # Compare against what the derivation script would suggest and warn if different
+        SUGGESTED=""
+        DERIVATION_LOG=""
+        if [ "${OFIWG_RELEASE}" = "true" ]; then
+          SUGGESTED="${OFIWG_RELEASE_VERSION}"
+          DERIVATION_LOG="OFIWG release detected: upstream tag matches published release"
         else
           cd source
-          RELEASE_VERSION=$(bash "$GITHUB_WORKSPACE/.github/scripts/derive-release-version.sh" "${INPUT_REF}" | awk '{print $NF}')
+          DERIVATION_LOG=$(bash "$GITHUB_WORKSPACE/.github/scripts/derive-release-version.sh" "${INPUT_REF}" 2>&1) || true
+          SUGGESTED=$(echo "${DERIVATION_LOG}" | tail -1 | awk '{print $NF}')
           cd ..
         fi
-        TAG="v${RELEASE_VERSION}"
-        echo "::debug::Derived version=${RELEASE_VERSION} tag=${TAG}"
+        if [ -n "${SUGGESTED}" ] && [ "${SUGGESTED}" != "${RELEASE_VERSION}" ]; then
+          ANNOTATION_LOG=$(echo "${DERIVATION_LOG}" | sed 's/$/%0A/' | tr -d '\n')
+          echo "::warning title=Specified version differs from derived suggestion::Specified version: ${RELEASE_VERSION}%0ADerived suggestion: ${SUGGESTED}%0A%0A${ANNOTATION_LOG}"
+        fi
+
         echo "version=${RELEASE_VERSION}" >> "$GITHUB_OUTPUT"
         echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
 
