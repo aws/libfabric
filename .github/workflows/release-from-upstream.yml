@@ -59,7 +59,7 @@ jobs:
       ofiwg_release: ${{ steps.ofiwg_release.outputs.ofiwg_release }}
     steps:
     - name: Checkout release tooling
-      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       with:
         persist-credentials: false
 
@@ -264,7 +264,7 @@ jobs:
       tag: ${{ steps.version.outputs.tag }}
     steps:
     - name: Checkout source from temporary build branch
-      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       with:
         ref: ${{ needs.prepare-source.outputs.build_ref }}
         fetch-depth: 0
@@ -308,7 +308,7 @@ jobs:
       prev_tag: ${{ steps.prev.outputs.tag }}
     steps:
     - name: Checkout release tooling
-      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       with:
         persist-credentials: false
 
@@ -403,7 +403,7 @@ jobs:
       attestations: write
     steps:
     - name: Checkout release tooling
-      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       with:
         persist-credentials: false
 
@@ -534,7 +534,7 @@ jobs:
 
     - name: Create release
       id: create-release
-      uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
+      uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
