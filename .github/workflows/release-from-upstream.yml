@@ -59,7 +59,7 @@ jobs:
       ofiwg_release: ${{ steps.ofiwg_release.outputs.ofiwg_release }}
     steps:
     - name: Checkout release tooling
-      uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         persist-credentials: false
 
@@ -264,7 +264,7 @@ jobs:
       tag: ${{ steps.version.outputs.tag }}
     steps:
     - name: Checkout source from temporary build branch
-      uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         ref: ${{ needs.prepare-source.outputs.build_ref }}
         fetch-depth: 0
@@ -308,7 +308,7 @@ jobs:
       prev_tag: ${{ steps.prev.outputs.tag }}
     steps:
     - name: Checkout release tooling
-      uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         persist-credentials: false
 
@@ -403,7 +403,7 @@ jobs:
       attestations: write
     steps:
     - name: Checkout release tooling
-      uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         persist-credentials: false
 
@@ -452,7 +452,7 @@ jobs:
 
     - name: Attest release artifacts
       id: attest
-      uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+      uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
       with:
         subject-path: 'release-artifacts/*.tar.*'
 
@@ -505,7 +505,7 @@ jobs:
 
     - name: Attest upstream source binding
       id: source-binding-attest
-      uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+      uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
       with:
         subject-path: 'release-artifacts/*.tar.*'
         predicate-type: 'urn:aws:libfabric:attestation:upstream-binding:v1'
@@ -534,7 +534,7 @@ jobs:
 
     - name: Create release
       id: create-release
-      uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
+      uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
