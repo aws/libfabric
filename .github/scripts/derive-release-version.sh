@@ -12,7 +12,7 @@ if [[ "${REF}" =~ ^v?([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
 
     if ! git ls-remote --exit-code --tags "${UPSTREAM_LIBFABRIC_REPO}" "refs/tags/${BASE_UPSTREAM_TAG}" >/dev/null 2>&1; then
         echo "Error: upstream tag '${BASE_UPSTREAM_TAG}' does not exist in ${UPSTREAM_LIBFABRIC_REPO}." >&2
-        echo "Use version_override to specify a version manually." >&2
+        echo "Supply the required workflow version input manually." >&2
         exit 1
     fi
     echo "Using exact upstream release tag from ref: ${BASE_UPSTREAM_TAG#v}" >&2
@@ -27,7 +27,7 @@ elif [[ "${REF}" =~ ^v?([0-9]+\.[0-9]+)\.x$ ]]; then
 
     if [ -z "${BASE_UPSTREAM_TAG}" ]; then
         echo "Error: no upstream release found for ${VERSION_PREFIX}.x series." >&2
-        echo "Use version_override to specify a version manually." >&2
+        echo "Supply the required workflow version input manually." >&2
         exit 1
     fi
     echo "Latest upstream release of ${VERSION_PREFIX}.x: ${BASE_UPSTREAM_TAG#v}" >&2
@@ -50,7 +50,7 @@ else
 
     if [ -z "${BASE_UPSTREAM_TAG}" ]; then
         echo "Error: no upstream ${VERSION_PREFIX}.x release tag is reachable from '${REF}'." >&2
-        echo "Use an exact upstream tag (vX.Y.Z), a series branch (vX.Y.x), or version_override." >&2
+        echo "Use an exact upstream tag (vX.Y.Z), a series branch (vX.Y.x), or supply the required workflow version input manually." >&2
         exit 1
     fi
     echo "Latest upstream release reachable from ${REF} in ${VERSION_PREFIX}.x: ${BASE_UPSTREAM_TAG#v}" >&2

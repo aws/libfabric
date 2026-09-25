@@ -56,7 +56,6 @@ jobs:
       release_commit_sha: ${{ steps.release_commit.outputs.sha }}
       build_ref: ${{ steps.build_ref.outputs.ref }}
       build_branch: ${{ steps.build_ref.outputs.branch }}
-      ofiwg_release: ${{ steps.ofiwg_release.outputs.ofiwg_release }}
     steps:
     - name: Checkout release tooling
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -74,8 +73,8 @@ jobs:
       env:
         VERSION: ${{ inputs.version }}
       run: |
-        if ! echo "${VERSION}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(amzn[0-9]+\.[0-9]+)?$'; then
-          echo "::error title=Invalid version::Version '${VERSION}' does not match expected format. Use 'X.Y.ZamznN.N' (e.g., '2.4.0amzn1.0') for AWS releases or 'X.Y.Z' (e.g., '2.4.0') for OFIWG passthrough releases."
+        if ! echo "${VERSION}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+amzn[0-9]+\.[0-9]+$'; then
+          echo "::error title=Invalid version::Version '${VERSION}' does not match the required AWS-specific format 'X.Y.ZamznN.N' (for example, '2.4.0amzn1.0'). Bare upstream versions are not permitted."
           exit 1
         fi
 
@@ -93,58 +92,44 @@ jobs:
         echo "upstream_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
         echo "upstream_sha_short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
 
-    - name: Detect OFIWG release build
-      id: ofiwg_release
+    - name: Reject published upstream release
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        UPSTREAM_REPO: ${{ inputs.upstream_repo }}
-        INPUT_REF: ${{ inputs.ref }}
         UPSTREAM_SHA: ${{ steps.upstream.outputs.upstream_sha }}
-        VERSION: ${{ inputs.version }}
       run: |
-        # OFIWG release build eligibility requires all of:
-        #  - upstream repo is ofiwg/libfabric (other upstreams always get the aws-patched path)
-        #  - version has no amzn suffix (pure upstream version implies passthrough)
-        #  - input ref matches exact semver tag pattern (vX.Y.Z, no prerelease suffix)
-        #  - a tag with that name exists upstream and points to the resolved SHA
-        #  - upstream has a published (non-draft, non-prerelease) release at that tag
-        IS_OFIWG_RELEASE=false
-        VERSION=""
-        if [ "${UPSTREAM_REPO}" = "ofiwg/libfabric" ] \
-           && ! echo "${VERSION}" | grep -q "amzn" \
-           && [[ "${INPUT_REF}" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
-          CANDIDATE_VERSION="${BASH_REMATCH[1]}"
-          CANDIDATE_TAG="v${CANDIDATE_VERSION}"
-          TAG_REF=$(gh api "repos/${UPSTREAM_REPO}/git/refs/tags/${CANDIDATE_TAG}" 2>/dev/null || true)
-          if [ -n "${TAG_REF}" ]; then
-            TAG_OBJECT_SHA=$(echo "${TAG_REF}" | jq -r '.object.sha')
-            TAG_OBJECT_TYPE=$(echo "${TAG_REF}" | jq -r '.object.type')
-            # Dereference annotated tags to the underlying commit
-            if [ "${TAG_OBJECT_TYPE}" = "tag" ]; then
-              TAG_OBJECT_SHA=$(gh api "repos/${UPSTREAM_REPO}/git/tags/${TAG_OBJECT_SHA}" --jq '.object.sha' 2>/dev/null || true)
-            fi
-            if [ "${TAG_OBJECT_SHA}" = "${UPSTREAM_SHA}" ]; then
-              RELEASE_STATE=$(gh api "repos/${UPSTREAM_REPO}/releases/tags/${CANDIDATE_TAG}" --jq '"draft=\(.draft) prerelease=\(.prerelease)"' 2>/dev/null || true)
-              if [ "${RELEASE_STATE}" = "draft=false prerelease=false" ]; then
-                IS_OFIWG_RELEASE=true
-                VERSION="${CANDIDATE_VERSION}"
-              fi
-            fi
-          fi
+        OFFICIAL_UPSTREAM_REPO="ofiwg/libfabric"
+
+        if ! RELEASE_TAGS=$(gh api "repos/${OFFICIAL_UPSTREAM_REPO}/releases" --paginate \
+          --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name'); then
+          echo "::error title=Unable to verify upstream release policy::Could not enumerate published releases from ${OFFICIAL_UPSTREAM_REPO}."
+          exit 1
         fi
-        echo "ofiwg_release=${IS_OFIWG_RELEASE}" >> "$GITHUB_OUTPUT"
-        echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-        if [ "${IS_OFIWG_RELEASE}" = "true" ]; then
-          echo "::notice title=OFIWG release build::Ref '${INPUT_REF}' matches published upstream release. Building without configure.ac patching; release tag will be 'v${VERSION}'."
+        if ! OFFICIAL_TAG_REFS=$(git ls-remote --tags "https://github.com/${OFFICIAL_UPSTREAM_REPO}.git"); then
+          echo "::error title=Unable to verify upstream release policy::Could not enumerate tags from ${OFFICIAL_UPSTREAM_REPO}."
+          exit 1
         fi
 
-    - name: Derive release version
+        while IFS= read -r RELEASE_TAG; do
+          [ -n "${RELEASE_TAG}" ] || continue
+          RELEASE_SHA=$(printf '%s\n' "${OFFICIAL_TAG_REFS}" | awk \
+            -v tag="refs/tags/${RELEASE_TAG}" \
+            '$2 == tag { direct = $1 } $2 == tag "^{}" { peeled = $1 } END { print peeled ? peeled : direct }')
+          if [ -z "${RELEASE_SHA}" ]; then
+            echo "::error title=Unable to verify upstream release policy::Published release tag '${RELEASE_TAG}' could not be resolved in ${OFFICIAL_UPSTREAM_REPO}."
+            exit 1
+          fi
+          if [ "${RELEASE_SHA}" = "${UPSTREAM_SHA}" ]; then
+            RELEASE_URL="${GITHUB_SERVER_URL}/${OFFICIAL_UPSTREAM_REPO}/releases/tag/${RELEASE_TAG}"
+            echo "::error title=Official upstream release cannot be rebuilt::The selected ref resolves exactly to published upstream release ${RELEASE_TAG} (${RELEASE_URL}). AWS does not mirror or rebuild official upstream releases. Consume the OFIWG release directly, or select an unreleased upstream ref, such as the current tip of a backport branch."
+            exit 1
+          fi
+        done <<< "${RELEASE_TAGS}"
+
+    - name: Check release version suggestion
       id: version
       env:
         VERSION: ${{ inputs.version }}
         INPUT_REF: ${{ inputs.ref }}
-        OFIWG_RELEASE: ${{ steps.ofiwg_release.outputs.ofiwg_release }}
-        OFIWG_RELEASE_VERSION: ${{ steps.ofiwg_release.outputs.version }}
         AWS_LIBFABRIC_REPO: https://github.com/${{ github.repository }}.git
         UPSTREAM_LIBFABRIC_REPO: https://github.com/${{ inputs.upstream_repo }}.git
       run: |
@@ -152,17 +137,15 @@ jobs:
         TAG="v${RELEASE_VERSION}"
 
         # Compare against what the derivation script would suggest and warn if different
+        cd source
         SUGGESTED=""
-        DERIVATION_LOG=""
-        if [ "${OFIWG_RELEASE}" = "true" ]; then
-          SUGGESTED="${OFIWG_RELEASE_VERSION}"
-          DERIVATION_LOG="OFIWG release detected: upstream tag matches published release"
-        else
-          cd source
-          DERIVATION_LOG=$(bash "$GITHUB_WORKSPACE/.github/scripts/derive-release-version.sh" "${INPUT_REF}" 2>&1) || true
+        if DERIVATION_LOG=$(bash "$GITHUB_WORKSPACE/.github/scripts/derive-release-version.sh" "${INPUT_REF}" 2>&1); then
           SUGGESTED=$(echo "${DERIVATION_LOG}" | tail -1 | awk '{print $NF}')
-          cd ..
+        else
+          ANNOTATION_LOG=$(echo "${DERIVATION_LOG}" | sed 's/$/%0A/' | tr -d '\n')
+          echo "::notice title=Unable to derive version suggestion::Continuing with the operator-specified version '${VERSION}'.%0A${ANNOTATION_LOG}"
         fi
+        cd ..
         if [ -n "${SUGGESTED}" ] && [ "${SUGGESTED}" != "${RELEASE_VERSION}" ]; then
           ANNOTATION_LOG=$(echo "${DERIVATION_LOG}" | sed 's/$/%0A/' | tr -d '\n')
           echo "::warning title=Specified version differs from derived suggestion::Specified version: ${RELEASE_VERSION}%0ADerived suggestion: ${SUGGESTED}%0A%0A${ANNOTATION_LOG}"
@@ -184,7 +167,6 @@ jobs:
         fi
 
     - name: Patch version
-      if: steps.ofiwg_release.outputs.ofiwg_release != 'true'
       env:
         RELEASE_VERSION: ${{ steps.version.outputs.version }}
       run: |
@@ -193,7 +175,6 @@ jobs:
         sed -i "s/AC_INIT(\[libfabric\], \[[^]]*\], \[[^]]*\])/AC_INIT([libfabric], [${RELEASE_VERSION}], [ec2-efa-maintainers@amazon.com])/" configure.ac
 
     - name: Verify version patch
-      if: steps.ofiwg_release.outputs.ofiwg_release != 'true'
       env:
         RELEASE_VERSION: ${{ steps.version.outputs.version }}
       run: |
@@ -204,24 +185,40 @@ jobs:
           exit 1
         fi
 
-    - name: Record release commit
+    - name: Create sanitized release commit
       id: release_commit
       env:
-        OFIWG_RELEASE: ${{ steps.ofiwg_release.outputs.ofiwg_release }}
         RELEASE_VERSION: ${{ steps.version.outputs.version }}
-        UPSTREAM_SHA: ${{ steps.upstream.outputs.upstream_sha }}
       run: |
         cd source
-        if [ "${OFIWG_RELEASE}" = "true" ]; then
-          # No patch commit; release commit == upstream commit
-          echo "sha=${UPSTREAM_SHA}" >> "$GITHUB_OUTPUT"
-        else
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add configure.ac
-          git commit -m "v${RELEASE_VERSION}"
-          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+        git config user.name "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+        # GitHub's GITHUB_TOKEN cannot push commits that introduce upstream
+        # workflow files. Build a root snapshot so workflow changes are absent
+        # from both the release tree and its ancestry.
+        SNAPSHOT_INDEX="${RUNNER_TEMP}/release-index-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+        trap 'rm -f "${SNAPSHOT_INDEX}"' EXIT
+        GIT_INDEX_FILE="${SNAPSHOT_INDEX}" git read-tree HEAD
+        GIT_INDEX_FILE="${SNAPSHOT_INDEX}" git rm -r --cached --ignore-unmatch .github/workflows
+
+        GIT_INDEX_FILE="${SNAPSHOT_INDEX}" git add configure.ac
+
+        SNAPSHOT_TREE=$(GIT_INDEX_FILE="${SNAPSHOT_INDEX}" git write-tree)
+        RELEASE_COMMIT=$(printf 'v%s\n' "${RELEASE_VERSION}" | git commit-tree "${SNAPSHOT_TREE}")
+        git checkout --force --detach "${RELEASE_COMMIT}"
+
+        if git ls-tree -r --name-only HEAD -- .github/workflows | grep -q .; then
+          echo "::error title=Release sanitization failed::Release commit contains files under .github/workflows"
+          exit 1
         fi
+        if git rev-parse HEAD^ >/dev/null 2>&1; then
+          echo "::error title=Release sanitization failed::Release commit unexpectedly has a parent"
+          exit 1
+        fi
+
+        echo "sha=${RELEASE_COMMIT}" >> "$GITHUB_OUTPUT"
 
     - name: Check version reservation
       env:
@@ -304,8 +301,6 @@ jobs:
   preview:
     needs: [prepare-source, build-artifacts]
     runs-on: ubuntu-latest
-    outputs:
-      prev_tag: ${{ steps.prev.outputs.tag }}
     steps:
     - name: Checkout release tooling
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -334,19 +329,6 @@ jobs:
           exit 1
         fi
 
-    - name: Find previous release tag
-      id: prev
-      env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        REPO: ${{ github.repository }}
-      run: |
-        PREV_TAG=$(gh api "repos/${REPO}/releases" --paginate \
-          -q '[.[] | select(.draft == false and .prerelease == false) | .tag_name] | .[]' \
-          | grep -E '^v[0-9].*amzn[0-9]+\.[0-9]+$' \
-          | sort -V \
-          | tail -1)
-        echo "tag=${PREV_TAG}" >> "$GITHUB_OUTPUT"
-
     - name: Render preview
       env:
         RELEASE_VERSION: ${{ needs.build-artifacts.outputs.version }}
@@ -354,27 +336,18 @@ jobs:
         UPSTREAM_SHA: ${{ needs.prepare-source.outputs.upstream_sha }}
         RELEASE_REPO: ${{ github.repository }}
         SERVER_URL: ${{ github.server_url }}
-        PREV_TAG: ${{ steps.prev.outputs.tag }}
         CURRENT_TAG: ${{ needs.build-artifacts.outputs.tag }}
         RELEASE_COMMIT_SHA: ${{ needs.prepare-source.outputs.release_commit_sha }}
-        BUILD_TYPE: ${{ needs.prepare-source.outputs.ofiwg_release == 'true' && 'ofiwg-release' || 'aws-patched' }}
-        BUILD_TYPE_LABEL: ${{ needs.prepare-source.outputs.ofiwg_release == 'true' && 'Official OFIWG release' || 'AWS release' }}
         BUILD_ATTESTATION_URL: "[link generated at publish time]"
         SOURCE_BINDING_ATTESTATION_URL: "[link generated at publish time]"
       run: |
         BODY=$(bash "$GITHUB_WORKSPACE/.github/scripts/render-release-body.sh")
-        PREV_LINK="(none)"
-        if [ -n "${PREV_TAG}" ]; then
-          PREV_LINK="[${PREV_TAG}](${SERVER_URL}/${RELEASE_REPO}/releases/tag/${PREV_TAG})"
-        fi
         {
           echo "## Release Preview"
-          echo "- Build type: ${BUILD_TYPE_LABEL}"
           echo "- Version: ${RELEASE_VERSION}"
           echo "- Tag: \`${CURRENT_TAG}\`"
           echo "- Upstream ref: ${UPSTREAM_REPO}@${UPSTREAM_SHA}"
           echo "- Release commit: ${RELEASE_REPO}@${RELEASE_COMMIT_SHA}"
-          echo "- Previous release: ${PREV_LINK}"
           echo ""
           echo "### Artifacts"
           echo ""
@@ -466,7 +439,6 @@ jobs:
         RELEASE_VERSION: ${{ needs.build-artifacts.outputs.version }}
         RELEASE_COMMIT: ${{ needs.prepare-source.outputs.release_commit_sha }}
         WORKFLOW_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        BUILD_TYPE: ${{ needs.prepare-source.outputs.ofiwg_release == 'true' && 'ofiwg-release' || 'aws-patched' }}
       run: |
         CHECKSUMS=$(sha256sum release-artifacts/*.tar.* | sort -k2)
         ARTIFACTS_JSON=$(printf '%s\n' "${CHECKSUMS}" | jq -R -s '
@@ -484,7 +456,6 @@ jobs:
           --arg release_version "${RELEASE_VERSION}" \
           --arg release_commit "${RELEASE_COMMIT}" \
           --arg workflow_run_url "${WORKFLOW_RUN_URL}" \
-          --arg build_type "${BUILD_TYPE}" \
           --argjson artifacts "${ARTIFACTS_JSON}" \
           '{
             source: {
@@ -497,8 +468,7 @@ jobs:
               version: $release_version,
               tag: $release_tag,
               commit: $release_commit,
-              workflow_run_url: $workflow_run_url,
-              build_type: $build_type
+              workflow_run_url: $workflow_run_url
             },
             artifacts: $artifacts
           }' > source-binding-predicate.json
@@ -519,9 +489,7 @@ jobs:
         UPSTREAM_SHA: ${{ needs.prepare-source.outputs.upstream_sha }}
         RELEASE_REPO: ${{ github.repository }}
         SERVER_URL: ${{ github.server_url }}
-        PREV_TAG: ${{ needs.preview.outputs.prev_tag }}
         CURRENT_TAG: ${{ needs.build-artifacts.outputs.tag }}
-        BUILD_TYPE: ${{ needs.prepare-source.outputs.ofiwg_release == 'true' && 'ofiwg-release' || 'aws-patched' }}
         BUILD_ATTESTATION_URL: ${{ steps.attest.outputs.attestation-url }}
         SOURCE_BINDING_ATTESTATION_URL: ${{ steps.source-binding-attest.outputs.attestation-url }}
       run: |
@@ -554,14 +522,12 @@ jobs:
         RELEASE_REPO: ${{ github.repository }}
         SERVER_URL: ${{ github.server_url }}
         RELEASE_COMMIT_SHA: ${{ needs.prepare-source.outputs.release_commit_sha }}
-        BUILD_TYPE_LABEL: ${{ needs.prepare-source.outputs.ofiwg_release == 'true' && 'Official OFIWG release' || 'AWS release' }}
         ATTEST_URL: ${{ steps.attest.outputs.attestation-url }}
         SOURCE_BINDING_URL: ${{ steps.source-binding-attest.outputs.attestation-url }}
         RELEASE_URL: ${{ steps.create-release.outputs.url }}
       run: |
         {
           echo "## Release Summary"
-          echo "- **Build type**: ${BUILD_TYPE_LABEL}"
           echo "- **Version**: ${RELEASE_VERSION}"
           echo "- **Tag**: [\`${CURRENT_TAG}\`](${SERVER_URL}/${RELEASE_REPO}/releases/tag/${CURRENT_TAG})"
           echo "- **Upstream ref**: ${UPSTREAM_REPO}@${UPSTREAM_SHA}"
