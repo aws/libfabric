@@ -1,0 +1,1333 @@
+/* SPDX-License-Identifier: BSD-2-Clause OR GPL-2.0-only */
+/* SPDX-FileCopyrightText: Copyright Amazon.com, Inc. or its affiliates. All rights reserved. */
+
+#include "efa.h"
+
+#include "efa_rdm_msg.h"
+#include "efa_cntr.h"
+#include "efa_rdm_pke_cmd.h"
+#include "efa_rdm_pke_utils.h"
+#include "efa_rdm_pke_nonreq.h"
+#include "efa_rdm_peer.h"
+
+#include "efa_rdm_tracepoint.h"
+
+/* This file define functons for the following packet type:
+ *       HANDSHAKE
+ *       CTS
+ *       CTSDATA
+ *       READRSP
+ *       RMA_CONTEXT
+ *       EOR
+ */
+
+/* HANDSHAKE packet related functions */
+
+ssize_t efa_rdm_pke_init_handshake(struct efa_rdm_pke *pkt_entry,
+				   struct efa_rdm_peer *peer)
+{
+	int nex;
+	struct efa_rdm_handshake_hdr *handshake_hdr;
+	struct efa_rdm_handshake_opt_connid_hdr *connid_hdr;
+	struct efa_rdm_handshake_opt_host_id_hdr *host_id_hdr;
+	struct efa_rdm_handshake_opt_device_version_hdr *device_version_hdr;
+	struct efa_rdm_handshake_opt_hmem_cap_hdr *hmem_cap_hdr;
+
+	handshake_hdr = (struct efa_rdm_handshake_hdr *)pkt_entry->wiredata;
+	handshake_hdr->type = EFA_RDM_HANDSHAKE_PKT;
+	handshake_hdr->version = EFA_RDM_PROTOCOL_VERSION;
+	handshake_hdr->flags = 0;
+
+	nex = (EFA_RDM_NUM_EXTRA_FEATURE_OR_REQUEST-1)/64 + 1;
+	/*
+	 * The action of plus 3 is for backward compatibility.
+	 * See section 2.1 of protocol v4 document for detail.
+	 */
+	handshake_hdr->nextra_p3 = nex + 3;
+	memcpy(handshake_hdr->extra_info, pkt_entry->ep->extra_info, nex * sizeof(uint64_t));
+	pkt_entry->pkt_size = sizeof(struct efa_rdm_handshake_hdr) + nex * sizeof(uint64_t);
+
+	/*
+	 * Always include connid at the end of a handshake packet.
+	 * If peer cannot make use of connid, the connid will be ignored.
+	 */
+	connid_hdr = (struct efa_rdm_handshake_opt_connid_hdr *)(pkt_entry->wiredata + pkt_entry->pkt_size);
+	connid_hdr->connid = efa_rdm_ep_raw_addr(pkt_entry->ep)->qkey;
+	handshake_hdr->flags |= EFA_RDM_PKT_CONNID_HDR;
+	pkt_entry->pkt_size += sizeof(struct efa_rdm_handshake_opt_connid_hdr);
+
+	/**
+	 * Include the optional host id if it is non-zero
+	 */
+	if (pkt_entry->ep->host_id) {
+		host_id_hdr = (struct efa_rdm_handshake_opt_host_id_hdr *)(pkt_entry->wiredata + pkt_entry->pkt_size);
+		host_id_hdr->host_id = pkt_entry->ep->host_id;
+		handshake_hdr->flags |= EFA_RDM_HANDSHAKE_HOST_ID_HDR;
+		pkt_entry->pkt_size += sizeof(struct efa_rdm_handshake_opt_host_id_hdr);
+	}
+
+	/* Include the device version (0xEFA0, 0xEFA1, etc) */
+	device_version_hdr = (struct efa_rdm_handshake_opt_device_version_hdr *) (pkt_entry->wiredata + pkt_entry->pkt_size);
+
+	/* This assumes the global device list will never contain dissimilar EFA
+	 * devices. I.e. the PCI bus will only contain EFA devices with the same
+	 * vendor_part_id (0xEFA0, 0xEFA1, etc)
+	 */
+	device_version_hdr->device_version = g_efa_selected_device_list[0].ibv_attr.vendor_part_id;
+	handshake_hdr->flags |= EFA_RDM_HANDSHAKE_DEVICE_VERSION_HDR;
+	pkt_entry->pkt_size += sizeof (struct efa_rdm_handshake_opt_device_version_hdr);
+
+	/* Include HMEM capability header.
+	 * p2p_supported = 1 means the peer's buffers can be accessed by
+	 * the NIC directly for all operations posted to the NIC.
+	 */
+	hmem_cap_hdr = (struct efa_rdm_handshake_opt_hmem_cap_hdr *)
+		       (pkt_entry->wiredata + pkt_entry->pkt_size);
+	hmem_cap_hdr->p2p_supported = efa_rdm_ep_use_p2p(pkt_entry->ep);
+	handshake_hdr->flags |= EFA_RDM_HANDSHAKE_HMEM_P2P_HDR;
+	pkt_entry->pkt_size += sizeof(struct efa_rdm_handshake_opt_hmem_cap_hdr);
+
+	pkt_entry->peer = peer;
+	return 0;
+}
+
+void efa_rdm_pke_handle_handshake_recv(struct efa_rdm_pke *pkt_entry)
+{
+	struct efa_rdm_handshake_hdr *handshake_pkt;
+	struct efa_rdm_peer *peer;
+	struct efa_rdm_ope *txe;
+	struct dlist_entry *tmp;
+	uint64_t *host_id_ptr;
+
+	peer = pkt_entry->peer;
+	assert(peer);
+
+	efa_rdm_tracepoint(handshake_recv_completion, (size_t) pkt_entry);
+
+	EFA_INFO(FI_LOG_CQ,
+		 "HANDSHAKE received from peer with explicit fi_addr %" PRIu64
+		 " implicit fi_addr %" PRIu64 "\n",
+		 pkt_entry->peer->av_entry->efa_av_entry.fi_addr,
+		 pkt_entry->peer->av_entry->implicit_fi_addr);
+
+	handshake_pkt = (struct efa_rdm_handshake_hdr *)pkt_entry->wiredata;
+
+	/* nextra_p3 is number of members in extra_info plus 3.
+	 * See section 2.1 of protocol v4 document for detail
+	 */
+	peer->nextra_p3 = handshake_pkt->nextra_p3;
+	memcpy(peer->extra_info, handshake_pkt->extra_info,
+		   (handshake_pkt->nextra_p3 - 3) * sizeof(uint64_t));
+	peer->flags |= EFA_RDM_PEER_HANDSHAKE_RECEIVED;
+
+	if (peer->extra_info[0] & EFA_RDM_EXTRA_FEATURE_REQUEST_USER_RECV_QP) {
+		EFA_WARN(FI_LOG_CQ,
+			 "Peer requested zero-copy receive via USER_RECV_QP "
+			 "which has been deprecated in newer Libfabric "
+			 "versions. Communication will continue. Consider "
+			 "upgrading peer to a newer Libfabric version.\n");
+		if (handshake_pkt->flags & EFA_RDM_HANDSHAKE_USER_RECV_QP_HDR) {
+			struct efa_rdm_handshake_opt_user_recv_qp_hdr *user_recv_qp_hdr;
+			user_recv_qp_hdr = efa_rdm_pke_get_handshake_opt_user_recv_qp_ptr(pkt_entry);
+			peer->user_recv_qp.qpn = user_recv_qp_hdr->qpn;
+			peer->user_recv_qp.qkey = user_recv_qp_hdr->qkey;
+		}
+	}
+
+	host_id_ptr = efa_rdm_pke_get_handshake_opt_host_id_ptr(pkt_entry);
+	if (host_id_ptr) {
+		peer->host_id = *host_id_ptr;
+		EFA_INFO(FI_LOG_CQ, "Received peer host id: i-%017lx\n", peer->host_id);
+	}
+
+	peer->device_version = efa_rdm_pke_get_handshake_opt_device_version(pkt_entry);
+	EFA_INFO(FI_LOG_CQ, "Received peer EFA device version: 0x%x\n", peer->device_version);
+
+	if (handshake_pkt->flags & EFA_RDM_HANDSHAKE_HMEM_P2P_HDR) {
+		struct efa_rdm_handshake_opt_hmem_cap_hdr *hmem_cap_hdr;
+
+		hmem_cap_hdr = efa_rdm_pke_get_handshake_opt_hmem_cap_ptr(pkt_entry);
+		peer->p2p_supported = hmem_cap_hdr->p2p_supported;
+		EFA_INFO(FI_LOG_CQ,
+			 "Received peer HMEM caps: p2p_supported=%u\n",
+			 peer->p2p_supported);
+	}
+	/* else: legacy peer without HMEM_P2P_HDR, peer->p2p_supported
+	 * remains true as initialized in efa_rdm_peer_construct(). */
+
+	/*
+	 * Peer-abort emits decided before this handshake were parked because
+	 * PEER_ERROR support was unknown; re-drive them now that the peer's
+	 * feature flags are known. The helper is idempotent and drain-gated;
+	 * it may release the txe (unsupported peer), so walk safely.
+	 */
+	dlist_foreach_container_safe(&peer->txe_list,
+				     struct efa_rdm_ope, txe,
+				     peer_entry, tmp) {
+		if ((txe->internal_flags & EFA_RDM_OPE_PEER_ABORT_PENDING) &&
+		    !(txe->internal_flags & EFA_RDM_PEER_ERROR_EMITTED_OR_SKIPPED))
+			efa_rdm_txe_progress_peer_abort_if_drained(txe);
+	}
+
+	efa_rdm_pke_release_rx(pkt_entry);
+}
+
+/*  CTS packet related functions */
+ssize_t efa_rdm_pke_init_cts(struct efa_rdm_pke *pkt_entry,
+			     struct efa_rdm_ope *ope)
+{
+	struct efa_rdm_cts_hdr *cts_hdr;
+	size_t bytes_left;
+
+	cts_hdr = (struct efa_rdm_cts_hdr *)pkt_entry->wiredata;
+	cts_hdr->type = EFA_RDM_CTS_PKT;
+	cts_hdr->version = EFA_RDM_PROTOCOL_VERSION;
+	cts_hdr->flags = 0;
+
+	if (ope->cq_entry.flags & FI_READ)
+		cts_hdr->flags |= EFA_RDM_CTS_READ_REQ;
+
+	/* CTS is sent by different communication protocols.
+	 * CTS is sent using txe in the emulated longcts read
+	 * protocol. The emulated longcts write and the longcts
+	 * message protocols sends CTS using rxe.
+	 * This check ensures appropriate tx_id and rx_id are
+	 * assigned for the respective protocols */
+	if (ope->type == EFA_RDM_TXE){
+		cts_hdr->send_id = ope->rx_id;
+		cts_hdr->recv_id = ope->tx_id;
+	} else {
+		assert(ope->type == EFA_RDM_RXE);
+		cts_hdr->send_id = ope->tx_id;
+		cts_hdr->recv_id = ope->rx_id;
+	}
+
+	bytes_left = ope->total_len - ope->bytes_received;
+	cts_hdr->recv_length = MIN(bytes_left, efa_env.tx_min_credits * ope->ep->max_data_payload_size);
+	assert(cts_hdr->recv_length > 0);
+	pkt_entry->pkt_size = sizeof(struct efa_rdm_cts_hdr);
+
+	/*
+	 * always set connid header. If the peer does not need it,
+	 * it will be ignored.
+	 */
+	cts_hdr->flags |= EFA_RDM_PKT_CONNID_HDR;
+	cts_hdr->connid = efa_rdm_ep_raw_addr(ope->ep)->qkey;
+
+	pkt_entry->peer = ope->peer;
+	efa_rdm_pke_set_ope(pkt_entry, (void *)ope);
+	return 0;
+}
+
+void efa_rdm_pke_handle_cts_sent(struct efa_rdm_pke *pkt_entry)
+{
+	struct efa_rdm_ope *ope;
+
+	ope = pkt_entry->ope;
+	ope->window = efa_rdm_pke_get_cts_hdr(pkt_entry)->recv_length;
+}
+
+/**
+ * @brief Handle CTS packet send completion.
+ *
+ * CTS can be sent by two different ope types:
+ *
+ * 1. rxe for longcts msg/write (DC and non-DC):
+ *    Release if efa_rdm_rxe_cts_ready_for_release(), which
+ *    checks recv completed, ops == 0, and no ACK in flight.
+ *
+ * 2. txe for emulated longcts read:
+ *    Release if efa_rdm_txe_emulated_read_ready_for_release(),
+ *    which checks recv completed and ops == 0.
+ *
+ * In both cases, the ope is released either here or in
+ * efa_rdm_ope_handle_recv_completed(), whichever happens last.
+ *
+ * @param[in] pkt_entry the CTS packet entry whose send completed
+ */
+void efa_rdm_pke_handle_cts_send_completion(struct efa_rdm_pke *pkt_entry)
+{
+	struct efa_rdm_ope *ope;
+
+	ope = pkt_entry->ope;
+	assert(ope);
+
+	if (ope->internal_flags & EFA_RDM_OPE_PEER_ABORT_PENDING) {
+		efa_rdm_rxe_release_peer_abort_if_drained(ope);
+		return;
+	}
+
+	if (ope->type == EFA_RDM_RXE) {
+		if (efa_rdm_rxe_cts_ready_for_release(ope))
+			efa_rdm_rxe_release(ope);
+	} else {
+		assert(ope->type == EFA_RDM_TXE);
+		if (efa_rdm_txe_emulated_read_ready_for_release(ope))
+			efa_rdm_txe_release(ope);
+	}
+}
+
+void efa_rdm_pke_handle_cts_recv(struct efa_rdm_pke *pkt_entry)
+{
+	struct efa_rdm_ep *ep;
+	struct efa_rdm_ope *ope;
+	struct efa_rdm_cts_hdr *cts_pkt;
+
+	ep = pkt_entry->ep;
+	cts_pkt = (struct efa_rdm_cts_hdr *)pkt_entry->wiredata;
+
+	/*
+	 * Drop a CTS whose id no longer names the operation that created it.
+	 */
+	ope = efa_rdm_ep_live_ope_from_id(ep, cts_pkt->send_id);
+	if (OFI_UNLIKELY(!ope)) {
+		EFA_INFO(FI_LOG_CQ,
+			 "CTS names ope id %" PRIu32 ", which no longer holds "
+			 "the operation that requested it. Dropping the CTS.\n",
+			 cts_pkt->send_id);
+		efa_rdm_pke_release_rx(pkt_entry);
+		return;
+	}
+
+	ope->rx_id = cts_pkt->recv_id;
+	ope->window = cts_pkt->recv_length;
+	assert(ope->window > 0);
+
+	efa_rdm_pke_release_rx(pkt_entry);
+
+	if (ope->state != EFA_RDM_OPE_SEND) {
+		ope->state = EFA_RDM_OPE_SEND;
+		dlist_insert_tail(&ope->entry, &ep->ope_longcts_send_list);
+		efa_rdm_ep_enqueue_progress_list(ep);
+	}
+}
+
+/* CTSDATA pakcet related functions */
+int efa_rdm_pke_init_ctsdata(struct efa_rdm_pke *pkt_entry,
+			     struct efa_rdm_ope *ope,
+			     size_t data_offset,
+			     int data_size)
+{
+	struct efa_rdm_ctsdata_hdr *data_hdr;
+	struct efa_rdm_ep *ep;
+	size_t hdr_size;
+	int ret;
+
+	ep = ope->ep;
+	data_hdr = efa_rdm_pke_get_ctsdata_hdr(pkt_entry);
+	data_hdr->type = EFA_RDM_CTSDATA_PKT;
+	data_hdr->version = EFA_RDM_PROTOCOL_VERSION;
+	data_hdr->flags = 0;
+
+	/* Data is sent using rxe in the emulated longcts read
+	 * protocol. The emulated longcts write and the longcts
+	 * message protocols sends data using txe.
+	 * This check ensures appropriate recv_id is
+	 * assigned for the respective protocols */
+	if (ope->type == EFA_RDM_RXE) {
+		data_hdr->recv_id = ope->tx_id;
+	} else {
+		assert(ope->type == EFA_RDM_TXE);
+		data_hdr->recv_id = ope->rx_id;
+		if (ope->internal_flags & EFA_RDM_TXE_DELIVERY_COMPLETE_REQUESTED)
+			pkt_entry->flags |= EFA_RDM_PKE_DC_LONGCTS_DATA;
+	}
+
+	hdr_size = sizeof(struct efa_rdm_ctsdata_hdr);
+	assert(ope->peer);
+	if (efa_rdm_peer_need_connid(ope->peer)) {
+		data_hdr->flags |= EFA_RDM_PKT_CONNID_HDR;
+		data_hdr->connid_hdr->connid = efa_rdm_ep_raw_addr(ep)->qkey;
+		hdr_size += sizeof(struct efa_rdm_ctsdata_opt_connid_hdr);
+	}
+
+	/*
+	 * Data packets are sent in order so using bytes_sent is okay here.
+	 */
+	data_hdr->seg_offset = data_offset;
+	data_hdr->seg_length = data_size;
+	ret = efa_rdm_pke_init_payload_from_ope(pkt_entry,
+						ope,
+						hdr_size,
+						data_offset,
+						data_size);
+	if (ret)
+		return ret;
+
+	efa_rdm_pke_set_ope(pkt_entry, (void *)ope);
+	pkt_entry->peer = ope->peer;
+
+	return 0;
+}
+
+void efa_rdm_pke_handle_ctsdata_sent(struct efa_rdm_pke *pkt_entry)
+{
+	struct efa_rdm_ope *ope;
+	struct efa_rdm_ctsdata_hdr *data_hdr;
+
+	data_hdr = efa_rdm_pke_get_ctsdata_hdr(pkt_entry);
+	assert(data_hdr->seg_length > 0);
+
+	ope = pkt_entry->ope;
+	ope->bytes_sent += data_hdr->seg_length;
+	ope->window -= data_hdr->seg_length;
+	assert(ope->window >= 0);
+}
+
+void efa_rdm_pke_handle_ctsdata_send_completion(struct efa_rdm_pke *pkt_entry)
+{
+	struct efa_rdm_ope *ope = pkt_entry->ope;
+	assert(ope);
+
+	/* An aborting txe's single completion + release are owned by the
+	 * peer-abort drain helper. Drive it here (this success completion is a
+	 * WR drain): a no-op until the txe's last WR drains, then it emits the
+	 * PEER_ERROR_PKT / writes the one completion. Never take the normal
+	 * success path (or the DC remote-ack release) for an aborting txe. */
+	if (ope->internal_flags & EFA_RDM_OPE_PEER_ABORT_PENDING) {
+		efa_rdm_txe_progress_peer_abort_if_drained(ope);
+		return;
+	}
+
+	/* if this DATA packet is used by a DC protocol, the tx entry should
+	 * be only released when both all TX ops are done and the receipt
+	 * has been received.
+	 */
+	if (pkt_entry->flags & EFA_RDM_PKE_DC_LONGCTS_DATA) {
+		assert(pkt_entry->ope);
+		if (efa_rdm_txe_with_remote_ack_ready_for_release(pkt_entry->ope))
+			efa_rdm_txe_release(pkt_entry->ope);
+		return;
+	}
+
+	ope->bytes_acked += efa_rdm_pke_get_ctsdata_hdr(pkt_entry)->seg_length;
+
+	if (ope->total_len == ope->bytes_acked)
+		efa_rdm_ope_handle_send_completed(ope);
+}
+
+void efa_rdm_pke_proc_ctsdata(struct efa_rdm_pke *pkt_entry,
+			      struct efa_rdm_ope *ope,
+			      char *data, size_t seg_offset,
+			      size_t seg_size)
+{
+	bool all_received = 0;
+	ssize_t err;
+
+#if ENABLE_DEBUG
+	int pkt_type = efa_rdm_pke_get_base_hdr(pkt_entry)->type;
+
+	assert(pkt_type == EFA_RDM_CTSDATA_PKT || pkt_type == EFA_RDM_READRSP_PKT);
+#endif
+	ope->bytes_received += seg_size;
+	assert(ope->bytes_received <= ope->total_len);
+	all_received = (ope->bytes_received == ope->total_len);
+
+	ope->window -= seg_size;
+#if ENABLE_DEBUG
+	/* ope can be released by #efa_rdm_pke_copy_payload_to_ope
+	 * so the call to dlist_remove must happen before
+	 * call to #efa_rdm_pke_copy_payload_to_ope
+	 */
+	if (all_received) {
+		dlist_remove(&ope->pending_recv_entry);
+		ope->ep->pending_recv_counter--;
+	}
+#endif
+	err = efa_rdm_pke_copy_payload_to_ope(pkt_entry, ope);
+	if (err) {
+		/* copy_payload_to_ope() releases pkt_entry on error; do not release it here. */
+		efa_rdm_rxe_handle_error(ope, -err, FI_EFA_ERR_RXE_COPY);
+	}
+
+	if (all_received)
+		return;
+
+	if (!ope->window) {
+		err = efa_rdm_ope_post_send_or_queue(ope, EFA_RDM_CTS_PKT);
+		if (err) {
+			EFA_WARN(FI_LOG_CQ, "post CTS packet failed!\n");
+			efa_rdm_rxe_handle_error(ope, -err, FI_EFA_ERR_PKT_POST);
+		}
+	}
+}
+
+void efa_rdm_pke_handle_ctsdata_recv(struct efa_rdm_pke *pkt_entry)
+{
+	struct efa_rdm_ctsdata_hdr *data_hdr;
+	struct efa_rdm_ope *ope;
+	size_t hdr_size;
+
+	data_hdr = efa_rdm_pke_get_ctsdata_hdr(pkt_entry);
+
+	ope = efa_rdm_ep_get_ope_from_ope_id(pkt_entry->ep, data_hdr->recv_id);
+
+	hdr_size = sizeof(struct efa_rdm_ctsdata_hdr);
+	if (data_hdr->flags & EFA_RDM_PKT_CONNID_HDR)
+		hdr_size += sizeof(struct efa_rdm_ctsdata_opt_connid_hdr);
+
+	efa_rdm_pke_proc_ctsdata(pkt_entry, ope,
+				 pkt_entry->wiredata + hdr_size,
+				 data_hdr->seg_offset,
+				 data_hdr->seg_length);
+}
+
+/*  READRSP packet functions */
+int efa_rdm_pke_init_readrsp(struct efa_rdm_pke *pkt_entry,
+			     struct efa_rdm_ope *rxe)
+{
+	struct efa_rdm_readrsp_hdr *readrsp_hdr;
+	int ret;
+
+	readrsp_hdr = efa_rdm_pke_get_readrsp_hdr(pkt_entry);
+	readrsp_hdr->type = EFA_RDM_READRSP_PKT;
+	readrsp_hdr->version = EFA_RDM_PROTOCOL_VERSION;
+	readrsp_hdr->flags = 0;
+	readrsp_hdr->send_id = rxe->rx_id;
+	readrsp_hdr->recv_id = rxe->tx_id;
+	readrsp_hdr->flags |= EFA_RDM_PKT_CONNID_HDR;
+	readrsp_hdr->connid = efa_rdm_ep_raw_addr(rxe->ep)->qkey;
+	readrsp_hdr->seg_length = MIN(rxe->ep->mtu_size - sizeof(struct efa_rdm_readrsp_hdr),
+				      rxe->total_len);
+	pkt_entry->peer = rxe->peer;
+	ret = efa_rdm_pke_init_payload_from_ope(pkt_entry, rxe,
+						sizeof(struct efa_rdm_readrsp_hdr),	/* payload offset */
+						0,					/* segment offset */
+						readrsp_hdr->seg_length);
+	return ret;
+}
+
+void efa_rdm_pke_handle_readrsp_sent(struct efa_rdm_pke *pkt_entry)
+{
+	struct efa_rdm_ope *rxe;
+	size_t data_len;
+
+	rxe = pkt_entry->ope;
+	data_len = efa_rdm_pke_get_readrsp_hdr(pkt_entry)->seg_length;
+	rxe->bytes_sent += data_len;
+	rxe->window -= data_len;
+	assert(rxe->window >= 0);
+	if (rxe->bytes_sent < rxe->total_len) {
+		if (efa_is_cache_available(efa_rdm_ep_rdm_domain(pkt_entry->ep)))
+			efa_rdm_ope_try_fill_desc(rxe, 0, FI_SEND);
+
+		rxe->state = EFA_RDM_OPE_SEND;
+		dlist_insert_tail(&rxe->entry, &pkt_entry->ep->ope_longcts_send_list);
+		efa_rdm_ep_enqueue_progress_list(pkt_entry->ep);
+	}
+}
+
+void efa_rdm_pke_handle_readrsp_send_completion(struct efa_rdm_pke *pkt_entry)
+{
+	struct efa_rdm_ope *rxe;
+	struct efa_rdm_readrsp_hdr *readrsp_hdr;
+
+	readrsp_hdr = (struct efa_rdm_readrsp_hdr *)pkt_entry->wiredata;
+
+	rxe = pkt_entry->ope;
+	assert(rxe->cq_entry.flags & FI_READ);
+	rxe->bytes_acked += readrsp_hdr->seg_length;
+	if (rxe->total_len == rxe->bytes_acked)
+		efa_rdm_ope_handle_send_completed(rxe);
+}
+
+void efa_rdm_pke_handle_readrsp_recv(struct efa_rdm_pke *pkt_entry)
+{
+	struct efa_rdm_readrsp_pkt *readrsp_pkt = NULL;
+	struct efa_rdm_readrsp_hdr *readrsp_hdr = NULL;
+	struct efa_rdm_ope *txe = NULL;
+
+	readrsp_pkt = (struct efa_rdm_readrsp_pkt *)pkt_entry->wiredata;
+	readrsp_hdr = &readrsp_pkt->hdr;
+	txe = efa_rdm_ep_live_txe_from_id(pkt_entry->ep, readrsp_hdr->recv_id);
+	if (!txe) {
+		EFA_INFO(FI_LOG_CQ,
+			 "READRSP names a read that is no longer live, dropping it\n");
+		efa_rdm_pke_release_rx(pkt_entry);
+		return;
+	}
+
+	assert(txe->cq_entry.flags & FI_READ);
+	txe->rx_id = readrsp_hdr->send_id;
+	efa_rdm_pke_proc_ctsdata(pkt_entry, txe,
+				 readrsp_pkt->data,
+				 0, readrsp_hdr->seg_length);
+}
+
+/*  RMA_CONTEXT packet functions
+ *
+ *  RMA context packet is used a context of RMA operations and is not
+ *  sent over wire. It is named packet because currently all EFA operation
+ *  use a packet as context.
+ */
+void efa_rdm_pke_init_write_context(struct efa_rdm_pke *pkt_entry,
+				    struct efa_rdm_ope *txe, void *local_buf,
+				    size_t seg_size, void *desc,
+				    uint64_t remote_buf, size_t remote_key)
+{
+	struct efa_rdm_rma_context_pkt *rma_context_pkt;
+
+	efa_rdm_pke_set_ope(pkt_entry, (void *)txe);
+	pkt_entry->peer = txe->peer;
+	rma_context_pkt = (struct efa_rdm_rma_context_pkt *)pkt_entry->wiredata;
+	rma_context_pkt->type = EFA_RDM_RMA_CONTEXT_PKT;
+	rma_context_pkt->version = EFA_RDM_PROTOCOL_VERSION;
+	rma_context_pkt->context_type = EFA_RDM_RDMA_WRITE_CONTEXT;
+	rma_context_pkt->tx_id = txe->tx_id;
+
+	rma_context_pkt->local_buf = local_buf;
+	rma_context_pkt->seg_size = seg_size;
+	rma_context_pkt->desc = desc;
+	rma_context_pkt->remote_buf = remote_buf;
+	rma_context_pkt->remote_key = remote_key;
+}
+
+void efa_rdm_pke_init_read_context(struct efa_rdm_pke *pkt_entry,
+				   struct efa_rdm_ope *ope,
+				   int read_id,
+				   size_t seg_size)
+{
+	struct efa_rdm_rma_context_pkt *ctx_pkt;
+
+	efa_rdm_pke_set_ope(pkt_entry, ope);
+	pkt_entry->peer = ope->peer;
+	pkt_entry->pkt_size = sizeof(struct efa_rdm_rma_context_pkt);
+
+	ctx_pkt = (struct efa_rdm_rma_context_pkt *)pkt_entry->wiredata;
+	ctx_pkt->type = EFA_RDM_RMA_CONTEXT_PKT;
+	ctx_pkt->flags = 0;
+	ctx_pkt->version = EFA_RDM_PROTOCOL_VERSION;
+	ctx_pkt->context_type = EFA_RDM_RDMA_READ_CONTEXT;
+	ctx_pkt->read_id = read_id;
+	ctx_pkt->seg_size = seg_size;
+}
+
+static
+void efa_rdm_pke_handle_rma_read_completion(struct efa_rdm_pke *context_pkt_entry)
+{
+	enum efa_rdm_ope_type x_entry_type;
+	struct efa_rdm_ope *txe;
+	struct efa_rdm_ope *rxe;
+	struct efa_rdm_pke *data_pkt_entry;
+	struct efa_rdm_rma_context_pkt *rma_context_pkt;
+	int err;
+
+	rma_context_pkt = (struct efa_rdm_rma_context_pkt *)context_pkt_entry->wiredata;
+	assert(rma_context_pkt->type == EFA_RDM_RMA_CONTEXT_PKT);
+	assert(rma_context_pkt->context_type == EFA_RDM_RDMA_READ_CONTEXT);
+
+	x_entry_type = context_pkt_entry->ope->type;
+	if (x_entry_type == EFA_RDM_TXE) {
+		txe = context_pkt_entry->ope;
+		assert(txe->op == ofi_op_read_req);
+		txe->bytes_read_completed += rma_context_pkt->seg_size;
+		if (txe->bytes_read_total_len == txe->bytes_read_completed) {
+			if (txe->peer == NULL) {
+				data_pkt_entry = txe->local_read_pkt_entry;
+				assert(data_pkt_entry->payload_size > 0);
+				efa_rdm_pke_assert_ope_valid(data_pkt_entry);
+				rxe = data_pkt_entry->ope;
+				efa_rdm_tracepoint(rx_pke_local_read_copy_payload_end, (size_t) data_pkt_entry, data_pkt_entry->payload_size, data_pkt_entry->ope->msg_id, (size_t) data_pkt_entry->ope->cq_entry.op_context, data_pkt_entry->ope->total_len);
+				/* The copy landed, so drop its rxe reference. */
+				assert(rxe->efa_outstanding_tx_ops > 0);
+				rxe->efa_outstanding_tx_ops--;
+				txe->local_read_pkt_entry = NULL;
+				if (rxe->internal_flags &
+				    EFA_RDM_OPE_PEER_ABORT_PENDING) {
+					/* Canceled recv: the drain owns its
+					 * completion, so skip the success path. */
+					efa_rdm_pke_release_rx(data_pkt_entry);
+					efa_rdm_rxe_release_peer_abort_if_drained(rxe);
+				} else {
+					/* Hand off pkt release to efa_rdm_pke_handle_data_copied(). */
+					efa_rdm_pke_handle_data_copied(data_pkt_entry);
+				}
+			} else {
+				assert(txe && txe->cq_entry.flags & FI_READ);
+				/*
+				 * efa_rdm_txe_report_completion() honors
+				 * EFA_RDM_TXE_NO_COMPLETION and
+				 * EFA_RDM_TXE_NO_COUNTER, so a txe whose
+				 * error was already returned synchronously
+				 * (both flags, set by
+				 * efa_rdm_rma_generic_readmsg()) stays
+				 * appropriately silent here.
+				 */
+				efa_rdm_txe_report_completion(txe);
+			}
+
+			efa_rdm_txe_release(txe);
+		}
+	} else {
+		assert(x_entry_type == EFA_RDM_RXE);
+		rxe = context_pkt_entry->ope;
+
+		/*
+		 * A long-read posts multiple READ WRs on one rxe; on a
+		 * source-MR cancel some fail and some succeed. The failed
+		 * one(s) marked the rxe peer-aborted, so a sibling that
+		 * still succeeds must NOT take the EOR / recv-completed path
+		 * (it would post a spurious EOR and a bogus success). The
+		 * error completion and free are deferred to the drain helper,
+		 * run here in case this is the last reference.
+		 */
+		if (rxe->internal_flags & EFA_RDM_OPE_PEER_ABORT_PENDING) {
+			efa_rdm_rxe_release_peer_abort_if_drained(rxe);
+			return;
+		}
+
+		rxe->bytes_read_completed += rma_context_pkt->seg_size;
+		assert(rxe->bytes_read_completed <= rxe->bytes_read_total_len);
+		if (rxe->bytes_read_completed == rxe->bytes_read_total_len) {
+			efa_rdm_tracepoint(read_completed,
+				    rxe->msg_id, (size_t) rxe->cq_entry.op_context,
+				    rxe->total_len, (size_t) rxe);
+			err = efa_rdm_ope_post_send_or_queue(rxe, EFA_RDM_EOR_PKT);
+			if (OFI_UNLIKELY(err)) {
+				EFA_WARN(FI_LOG_CQ,
+					"Posting of EOR failed! err=%s(%d)\n",
+					fi_strerror(-err), -err);
+				efa_rdm_rxe_handle_error(rxe, -err, FI_EFA_ERR_PKT_POST);
+				efa_rdm_rxe_release(rxe);
+			}
+
+			rxe->internal_flags |= EFA_RDM_RXE_ACK_IN_FLIGHT;
+			rxe->bytes_received += rxe->bytes_read_completed;
+			rxe->bytes_copied += rxe->bytes_read_completed;
+			if (rxe->bytes_copied == rxe->total_len) {
+				efa_rdm_ope_handle_recv_completed(rxe);
+			} else if(rxe->bytes_copied + rxe->bytes_queued_blocking_copy == rxe->total_len) {
+				efa_rdm_ep_flush_queued_blocking_copy_to_hmem(context_pkt_entry->ep);
+			}
+		}
+	}
+}
+
+/**
+ * @brief Handle a single RMA completion (read or write)
+ *
+ * RMA Completion can either be caused by the completion of an RDMA Read,
+ * an emulated RDMA Write, or a true RDMA Write.
+ *
+ * Note that if true RDMA Read/Write was used, the packet here was not sent over
+ * but only used as the context for the request.
+ *
+ * @param ep[in,out]			Endpoint
+ * @param context_pkt_entry[in,out]	The "Packet" which serves as context
+ */
+void efa_rdm_pke_handle_rma_completion(struct efa_rdm_pke *context_pkt_entry)
+{
+	struct efa_rdm_ope *txe = NULL;
+	struct efa_rdm_rma_context_pkt *rma_context_pkt;
+
+	assert(efa_rdm_pke_get_base_hdr(context_pkt_entry)->version == EFA_RDM_PROTOCOL_VERSION);
+
+	/* pkt_entry->peer can be NULL for a local read operation, which shouldn't be ignored. */
+	if (!context_pkt_entry->peer && !(context_pkt_entry->flags & EFA_RDM_PKE_LOCAL_READ)) {
+		EFA_WARN(FI_LOG_CQ, "ignoring rma completion of a packet to a removed peer.\n");
+		efa_rdm_pke_release_tx(context_pkt_entry);
+		return;
+	}
+
+	rma_context_pkt = (struct efa_rdm_rma_context_pkt *)context_pkt_entry->wiredata;
+
+	switch (rma_context_pkt->context_type) {
+	case EFA_RDM_RDMA_WRITE_CONTEXT:
+		txe = context_pkt_entry->ope;
+		txe->bytes_write_completed += rma_context_pkt->seg_size;
+		if (txe->bytes_write_completed == txe->bytes_write_total_len) {
+			if (txe->fi_flags & FI_COMPLETION)
+				efa_rdm_txe_report_completion(txe);
+			else if (!(txe->internal_flags & EFA_RDM_TXE_NO_COUNTER))
+				efa_cntr_report_tx_completion(&context_pkt_entry->ep->base_ep.util_ep, txe->cq_entry.flags);
+			efa_rdm_txe_release(txe);
+		}
+		break;
+	case EFA_RDM_RDMA_READ_CONTEXT:
+		efa_rdm_pke_handle_rma_read_completion(context_pkt_entry);
+		break;
+	default:
+		EFA_WARN(FI_LOG_CQ, "invalid rma_context_type in EFA_RDM_RMA_CONTEXT_PKT %d\n",
+			rma_context_pkt->context_type);
+		assert(0 && "invalid EFA_RDM_RMA_CONTEXT_PKT rma_context_type\n");
+	}
+
+	efa_rdm_pke_release_tx(context_pkt_entry);
+}
+
+/*  EOR packet related functions */
+int efa_rdm_pke_init_eor(struct efa_rdm_pke *pkt_entry, struct efa_rdm_ope *rxe)
+{
+	struct efa_rdm_eor_hdr *eor_hdr;
+
+	eor_hdr = (struct efa_rdm_eor_hdr *)pkt_entry->wiredata;
+	eor_hdr->type = EFA_RDM_EOR_PKT;
+	eor_hdr->version = EFA_RDM_PROTOCOL_VERSION;
+	eor_hdr->flags = 0;
+	eor_hdr->send_id = rxe->tx_id;
+	eor_hdr->recv_id = rxe->rx_id;
+	eor_hdr->flags |= EFA_RDM_PKT_CONNID_HDR;
+	eor_hdr->connid = efa_rdm_ep_raw_addr(rxe->ep)->qkey;
+	pkt_entry->pkt_size = sizeof(struct efa_rdm_eor_hdr);
+	pkt_entry->peer = rxe->peer;
+	efa_rdm_pke_set_ope(pkt_entry, rxe);
+	return 0;
+}
+
+void efa_rdm_pke_handle_eor_send_completion(struct efa_rdm_pke *pkt_entry)
+{
+	struct efa_rdm_ope *rxe;
+
+	rxe = pkt_entry->ope;
+	assert(rxe && rxe->rx_id == efa_rdm_pke_get_eor_hdr(pkt_entry)->recv_id);
+
+	if (rxe->bytes_copied == rxe->total_len) {
+		efa_rdm_rxe_release(rxe);
+	} else {
+		rxe->internal_flags &= ~EFA_RDM_RXE_ACK_IN_FLIGHT;
+	}
+}
+
+/*  Read NACK packet related functions */
+int efa_rdm_pke_init_read_nack(struct efa_rdm_pke *pkt_entry, struct efa_rdm_ope *rxe)
+{
+	struct efa_rdm_read_nack_hdr *nack_hdr;
+
+	nack_hdr = (struct efa_rdm_read_nack_hdr *)pkt_entry->wiredata;
+	nack_hdr->type = EFA_RDM_READ_NACK_PKT;
+	nack_hdr->version = EFA_RDM_PROTOCOL_VERSION;
+	nack_hdr->flags = 0;
+	nack_hdr->send_id = rxe->tx_id;
+	nack_hdr->recv_id = rxe->rx_id;
+	nack_hdr->flags |= EFA_RDM_PKT_CONNID_HDR;
+	nack_hdr->connid = efa_rdm_ep_raw_addr(rxe->ep)->qkey;
+	pkt_entry->pkt_size = sizeof(struct efa_rdm_read_nack_hdr);
+	pkt_entry->peer = rxe->peer;
+	efa_rdm_pke_set_ope(pkt_entry, rxe);
+	return 0;
+}
+
+/*
+ *   Sender handles the acknowledgment (EFA_RDM_EOR_PKT) from receiver on the completion
+ *   of the large message copy via fi_readmsg operation
+ */
+void efa_rdm_pke_handle_eor_recv(struct efa_rdm_pke *pkt_entry)
+{
+	struct efa_rdm_eor_hdr *eor_hdr;
+	struct efa_rdm_ope *txe;
+
+	eor_hdr = (struct efa_rdm_eor_hdr *)pkt_entry->wiredata;
+
+	/* pre-post buf used here, so can NOT track back to txe with x_entry */
+	txe = efa_rdm_ep_live_txe_from_id(pkt_entry->ep, eor_hdr->send_id);
+	if (!txe) {
+		EFA_INFO(FI_LOG_CQ,
+			 "EOR names a send that is no longer live, dropping it\n");
+		efa_rdm_pke_release_rx(pkt_entry);
+		return;
+	}
+
+	efa_rdm_txe_release_read_msg_slot(txe);
+
+	txe->bytes_acked += txe->total_len - txe->bytes_runt;
+	if (txe->bytes_acked == txe->total_len) {
+		efa_rdm_txe_report_completion(txe);
+		/*
+		 * The txe is released either here or in
+		 * efa_rdm_pke_handle_send_completion() for the
+		 * LONGREAD_RTM packet, whichever happens last.
+		 * Release here if the send completion already arrived.
+		 */
+		txe->internal_flags |= EFA_RDM_TXE_REMOTE_ACK_RECEIVED;
+		if (efa_rdm_txe_with_remote_ack_ready_for_release(txe))
+			efa_rdm_txe_release(txe);
+	}
+
+	efa_rdm_pke_release_rx(pkt_entry);
+
+}
+
+/*
+ *   Sender handles the read NACK from receiver when receiver has failed to register the receive buffer
+ */
+void efa_rdm_pke_handle_read_nack_recv(struct efa_rdm_pke *pkt_entry)
+{
+	struct efa_rdm_read_nack_hdr *nack_hdr;
+	struct efa_rdm_ope *txe;
+	bool delivery_complete_requested;
+
+	nack_hdr = (struct efa_rdm_read_nack_hdr *) pkt_entry->wiredata;
+
+	txe = efa_rdm_ep_live_txe_from_id(pkt_entry->ep, nack_hdr->send_id);
+	if (!txe) {
+		EFA_INFO(FI_LOG_CQ,
+			 "READ_NACK names a send that is no longer live, dropping it\n");
+		efa_rdm_pke_release_rx(pkt_entry);
+		return;
+	}
+
+	efa_rdm_txe_release_read_msg_slot(txe);
+
+	efa_rdm_pke_release_rx(pkt_entry);
+	txe->internal_flags |= EFA_RDM_OPE_READ_NACK;
+
+	delivery_complete_requested = txe->fi_flags & FI_DELIVERY_COMPLETE;
+
+	if (txe->op == ofi_op_write) {
+		EFA_INFO(FI_LOG_EP_CTRL,
+			 "Sender fallback to emulated long CTS write "
+			 "protocol because p2p is not available\n");
+		txe->protocol = delivery_complete_requested ?
+				EFA_RDM_DC_LONGCTS_RTW_PKT :
+				EFA_RDM_LONGCTS_RTW_PKT;
+		efa_rdm_ope_post_send_or_queue(txe, txe->protocol);
+	} else if (txe->op == ofi_op_tagged) {
+		EFA_INFO(FI_LOG_EP_CTRL,
+			 "Sender fallback to long CTS tagged "
+			 "protocol because memory registration limit "
+			 "was reached on the receiver\n");
+		txe->protocol = delivery_complete_requested ?
+				EFA_RDM_DC_LONGCTS_TAGRTM_PKT :
+				EFA_RDM_LONGCTS_TAGRTM_PKT;
+		efa_rdm_ope_post_send_or_queue(txe, txe->protocol);
+	} else {
+		EFA_INFO(FI_LOG_EP_CTRL,
+			 "Sender fallback to long CTS untagged "
+			 "protocol because memory registration limit "
+			 "was reached on the receiver\n");
+		txe->protocol = delivery_complete_requested ?
+				EFA_RDM_DC_LONGCTS_MSGRTM_PKT :
+				EFA_RDM_LONGCTS_MSGRTM_PKT;
+		efa_rdm_ope_post_send_or_queue(txe, txe->protocol);
+	}
+}
+
+/* PEER_ERROR packet related functions */
+
+/**
+ * @brief Initialize an EFA_RDM_PEER_ERROR_PKT packet entry's wiredata
+ *
+ * @param[out] pkt_entry   packet entry whose wiredata will be filled
+ * @param[in]  msg_id      per-peer msg_id of the aborted transfer (always valid)
+ * @param[in]  op_id       peer-owned ope id, or EFA_RDM_OPE_ID_INVALID
+ * @param[in]  emitter_ope_type  the emitting side's enum efa_rdm_ope_type
+ * @param[in]  prov_errno  the prov_errno that triggered the abort
+ * @param[in]  connid      local endpoint's connection ID (qkey)
+ * @return     0 on success
+ */
+int efa_rdm_pke_init_peer_error(struct efa_rdm_pke *pkt_entry,
+				uint32_t msg_id, uint32_t op_id,
+				uint32_t emitter_ope_type, int prov_errno,
+				uint32_t connid)
+{
+	struct efa_rdm_peer_error_hdr *err_hdr;
+
+	err_hdr = efa_rdm_pke_get_peer_error_hdr(pkt_entry);
+	err_hdr->type = EFA_RDM_PEER_ERROR_PKT;
+	err_hdr->version = EFA_RDM_PROTOCOL_VERSION;
+	err_hdr->flags = EFA_RDM_PKT_CONNID_HDR;
+	err_hdr->msg_id = msg_id;
+	err_hdr->op_id = op_id;
+	err_hdr->emitter_ope_type = emitter_ope_type;
+	err_hdr->prov_errno = (uint32_t) prov_errno;
+	err_hdr->connid = connid;
+	pkt_entry->pkt_size = sizeof(struct efa_rdm_peer_error_hdr);
+	return 0;
+}
+
+/**
+ * @brief Initialize a PEER_ERROR_PKT from a aborted ope (rxe or txe).
+ *
+ * @param[out] pkt_entry packet entry whose wiredata will be filled
+ * @param[in]  ope       failing ope; ope->type is serialized as emitter_ope_type
+ * @return     0 on success
+ */
+int efa_rdm_pke_init_peer_error_for_ope(struct efa_rdm_pke *pkt_entry,
+					struct efa_rdm_ope *ope)
+{
+	uint32_t op_id = EFA_RDM_OPE_ID_INVALID;
+	uint32_t connid;
+
+	if (ope->type == EFA_RDM_RXE) {
+		/* An aborting receiver in the read based protocols carries the
+		 * peer's txe id, learned from the RTM, which the TX side needs
+		 * to resolve its txe. It is still the sentinel if no RTM ever
+		 * carried one. */
+		op_id = ope->tx_id;
+	} else {
+		/* An aborting sender never learns the receiver's rxe id, so
+		 * msg_id is the only key it can offer. */
+		assert(ope->type == EFA_RDM_TXE);
+	}
+
+	connid = efa_rdm_ep_raw_addr(ope->ep)->qkey;
+
+	efa_rdm_pke_set_ope(pkt_entry, ope);
+	pkt_entry->peer = ope->peer;
+	return efa_rdm_pke_init_peer_error(pkt_entry, ope->msg_id, op_id,
+					   ope->type,
+					   ope->peer_error_prov_errno, connid);
+}
+
+/**
+ * @brief RX-side outcome for an inbound PEER_ERROR that names an rxe.
+ *
+ * Decided purely from the rxe's local state, never from the wire, because a
+ * device TX error can fire after data landed: an already-completed recv is
+ * dropped (no double completion), an unexpected rxe owes no completion and
+ * is reaped, and a matched rxe completes FI_ECANCELED at WR drain.
+ */
+static void efa_rdm_pke_peer_error_handle_rxe(struct efa_rdm_ope *rxe,
+						      int prov_errno)
+{
+	if (rxe->internal_flags & EFA_RDM_OPE_RECV_COMPLETED) {
+		EFA_INFO(FI_LOG_CQ,
+			 "PEER_ERROR names msg_id=%u whose recv already "
+			 "completed; dropping (no double completion).\n",
+			 rxe->msg_id);
+		return;
+	}
+
+	if (rxe->state == EFA_RDM_RXE_UNEXP) {
+		/*
+		 * No user op bound -> no CQ entry owed: release the buffered
+		 * segments, then the rxe (efa_rdm_rxe_release frees peer_rxe via
+		 * free_entry, then release_internal).
+		 */
+		if (rxe->unexp_pkt) {
+			efa_rdm_pke_release_rx_list(rxe->unexp_pkt);
+			rxe->unexp_pkt = NULL;
+		}
+		efa_rdm_rxe_release(rxe);
+		return;
+	}
+
+	/*
+	 * Matched to a posted recv: owed a completion. Mark peer-aborted and
+	 * attempt the drain-gated release (a no-op while any WR still
+	 * references the rxe, e.g. an in-flight LONGCTS/RUNTREAD READ).
+	 * A declined rxe is left alone and the packet is dropped.
+	 */
+	if (!efa_rdm_rxe_mark_peer_aborted_if_needed(rxe, prov_errno)) {
+		EFA_WARN(FI_LOG_CQ,
+			 "PEER_ERROR resolved to rxe %p (op=%u), which is not "
+			 "a two-sided recv. A PEER_ERROR is never emitted for "
+			 "an emulated op.\n", rxe, rxe->op);
+		efa_base_ep_write_eq_error(&rxe->ep->base_ep, FI_EIO,
+					   FI_EFA_ERR_INVALID_PKT_TYPE);
+		return;
+	}
+	efa_rdm_rxe_release_peer_abort_if_drained(rxe);
+}
+
+/**
+ * @brief find an rxe by msg_id on the peer's rxe_list.
+ *
+ * Only mulreq (medium/runtread) rxes are inserted into the rxe_map for
+ * segment routing, but a msg_id-only PEER_ERROR still needs to find a
+ * matched or unexpected rxe of any protocol -- e.g. an unexpected eager
+ * message whose sender aborted after the data already landed.
+ *
+ * @param[in] peer    peer the PEER_ERROR arrived from
+ * @param[in] msg_id  per-peer message id named by the PEER_ERROR
+ * @return the rxe with a matching msg_id, or NULL if none exists
+ */
+static struct efa_rdm_ope *
+efa_rdm_pke_peer_error_find_rxe_via_msg_id(struct efa_rdm_peer *peer, uint32_t msg_id)
+{
+	struct efa_rdm_ope *rxe;
+
+	dlist_foreach_container(&peer->rxe_list, struct efa_rdm_ope, rxe,
+				peer_entry) {
+		if (rxe->msg_id == msg_id)
+			return rxe;
+	}
+
+	return NULL;
+}
+
+/**
+ * @brief Receiver-side dispatcher for inbound EFA_RDM_PEER_ERROR_PKT.
+ *
+ * A device TX error does not prove the data never reached the peer, so the
+ * emitting side cannot dictate the cleanup; the outcome is decided here from
+ * local state alone. The op_id hint is trusted only while its slot still
+ * names this transfer, since pooled opes are freed and reused and acting on
+ * a stale one would corrupt unrelated state. The TX side keeps no
+ * msg_id->txe map, so the hint is required to resolve a txe; rxes resolve
+ * via the msg_id-keyed rxe_map.
+ *
+ * @param[in] pkt_entry inbound PEER_ERROR_PKT to dispatch
+ */
+void efa_rdm_pke_handle_peer_error_recv(struct efa_rdm_pke *pkt_entry)
+{
+	struct efa_rdm_peer_error_hdr *err_hdr = efa_rdm_pke_get_peer_error_hdr(pkt_entry);
+	struct efa_rdm_ep *ep = pkt_entry->ep;
+	struct efa_rdm_ope *ope = NULL;
+
+	EFA_INFO(FI_LOG_CQ,
+		 "Received PEER_ERROR_PKT (msg_id=%u op_id=%u "
+		 "emitter_ope_type=%d prov_errno=%d  %s)\n",
+		 err_hdr->msg_id, err_hdr->op_id, err_hdr->emitter_ope_type, err_hdr->prov_errno,
+		 efa_strerror(err_hdr->prov_errno));
+
+	/*
+	 * The transfer's receiver is aborting (emitter_ope_type == RXE): its
+	 * RDMA READ failed. The wire carries our txe id, which the emitter
+	 * learned from the RTM, so trust it only if it still resolves to a
+	 * live txe of the generation that created it and still to this
+	 * transfer. An id the emitter never learned is the sentinel, which
+	 * resolves to nothing, and either way an unresolved hint means the txe
+	 * already cleaned up locally so the packet is dropped. Never fall
+	 * through to msg_id resolution, because TX and RX msg_id spaces are
+	 * independent counters and misrouting one into the receive reorder
+	 * state would corrupt it.
+	 */
+	if (err_hdr->emitter_ope_type == EFA_RDM_RXE) {
+		ope = efa_rdm_ep_live_txe_from_id(ep, err_hdr->op_id);
+		if (ope && ope->msg_id == err_hdr->msg_id) {
+			if (ope->internal_flags & EFA_RDM_OPE_PEER_ABORT_PENDING) {
+				EFA_INFO(FI_LOG_CQ,
+					 "PEER_ERROR for a txe already "
+					 "peer-aborting; dropping.\n");
+				goto out;
+			}
+
+			/*
+			 * A PEER_ERROR is sent in place of the EOR, so
+			 * mirror the EOR recv bookkeeping the success
+			 * path would have done.
+			 */
+			efa_rdm_txe_release_read_msg_slot(ope);
+
+			/*
+			 * Mark aborted and EMITTED (we owe no PEER_ERROR
+			 * back), then let handle_error drive the
+			 * drain-gated TX error completion once every WR
+			 * referencing this txe has drained (e.g. a
+			 * RUNTREAD whose runt sends are still
+			 * outstanding).
+			 */
+			ope->internal_flags |= EFA_RDM_OPE_PEER_ABORT_PENDING |
+					       EFA_RDM_PEER_ERROR_EMITTED_OR_SKIPPED;
+			efa_rdm_txe_handle_error(ope, FI_ECANCELED,
+						 FI_EFA_ERR_PEER_ABORTED);
+			goto out;
+		}
+		EFA_INFO(FI_LOG_CQ,
+			 "PEER_ERROR for a txe that has already cleaned up, "
+			 "dropping PEER_ERROR packet.\n");
+		goto out;
+	}
+
+	/*
+	 * The transfer's sender is aborting (emitter_ope_type == TXE). The
+	 * sender never learns the receiver's rxe id, so the packet carries no
+	 * usable hint and the rxe is resolved from local state by msg_id.
+	 */
+	assert(err_hdr->emitter_ope_type == EFA_RDM_TXE);
+	assert(pkt_entry->peer);
+
+	ope = efa_rdm_rxe_map_lookup(&pkt_entry->peer->rxe_map, err_hdr->msg_id);
+	if (ope && ope->type == EFA_RDM_RXE) {
+		efa_rdm_pke_peer_error_handle_rxe(ope, err_hdr->prov_errno);
+		goto out;
+	}
+
+	/*
+	 * rxe_map only holds mulreq rxes; fall back to scanning the peer's
+	 * rxe_list so non-mulreq rxes are found too (e.g. an unexpected
+	 * eager rxe must be reaped so the aborted message does not stay
+	 * matchable by a later recv).
+	 */
+	ope = efa_rdm_pke_peer_error_find_rxe_via_msg_id(pkt_entry->peer, err_hdr->msg_id);
+	if (ope) {
+		efa_rdm_pke_peer_error_handle_rxe(ope, err_hdr->prov_errno);
+		goto out;
+	}
+
+	/*
+	 * No rxe found for this msg_id: it is in exactly one of three states -- fully
+	 * processed (clean drop), buffered out-of-order (mark the buffered
+	 * segment aborted), or never arrived (queue an abort marker so the
+	 * reorder window slides past it). efa_rdm_peer_queue_aborted_msg_marker()
+	 * handles whichever applies and consumes pkt_entry -- do not touch it
+	 * afterward.
+	 */
+	(void) efa_rdm_peer_queue_aborted_msg_marker(pkt_entry->peer, ep, pkt_entry, err_hdr->msg_id);
+	return;
+
+out:
+	efa_rdm_pke_release_rx(pkt_entry);
+}
+
+/* receipt packet related functions */
+int efa_rdm_pke_init_receipt(struct efa_rdm_pke *pkt_entry, struct efa_rdm_ope *rxe)
+{
+	struct efa_rdm_receipt_hdr *receipt_hdr;
+
+	receipt_hdr = efa_rdm_pke_get_receipt_hdr(pkt_entry);
+	receipt_hdr->type = EFA_RDM_RECEIPT_PKT;
+	receipt_hdr->version = EFA_RDM_PROTOCOL_VERSION;
+	receipt_hdr->flags = 0;
+	receipt_hdr->tx_id = rxe->tx_id;
+	receipt_hdr->msg_id = rxe->msg_id;
+	receipt_hdr->flags |= EFA_RDM_PKT_CONNID_HDR;
+	receipt_hdr->connid = efa_rdm_ep_raw_addr(rxe->ep)->qkey;
+
+	pkt_entry->pkt_size = sizeof(struct efa_rdm_receipt_hdr);
+	pkt_entry->peer = rxe->peer;
+	efa_rdm_pke_set_ope(pkt_entry, rxe);
+
+	return 0;
+}
+
+void efa_rdm_pke_handle_receipt_send_completion(struct efa_rdm_pke *pkt_entry)
+{
+	struct efa_rdm_ope *rxe;
+
+	rxe = pkt_entry->ope;
+	/*
+	 * Clear ACK_IN_FLIGHT so the CTS send completion handler
+	 * (efa_rdm_pke_handle_cts_send_completion) can see that
+	 * no ack is pending and proceed with release.
+	 */
+	rxe->internal_flags &= ~EFA_RDM_RXE_ACK_IN_FLIGHT;
+	/*
+	 * Release the rxe if the CTS send completion has already
+	 * arrived (efa_outstanding_tx_ops == 0). Otherwise, the
+	 * CTS send completion handler will release it.
+	 */
+	if (rxe->efa_outstanding_tx_ops == 0)
+		efa_rdm_rxe_release(rxe);
+}
+
+void efa_rdm_pke_handle_receipt_recv(struct efa_rdm_pke *pkt_entry)
+{
+	struct efa_rdm_ope *txe = NULL;
+	struct efa_rdm_receipt_hdr *receipt_hdr;
+
+	receipt_hdr = efa_rdm_pke_get_receipt_hdr(pkt_entry);
+	/* Retrieve the txe that will be written into TX CQ*/
+	txe = efa_rdm_ep_live_txe_from_id(pkt_entry->ep, receipt_hdr->tx_id);
+	if (!txe) {
+		EFA_INFO(FI_LOG_CQ,
+			 "RECEIPT names a send that is no longer live, dropping it\n");
+		efa_rdm_pke_release_rx(pkt_entry);
+		return;
+	}
+
+	/* Write send completion immediately to preserve DC semantics */
+	efa_rdm_txe_report_completion(txe);
+
+	/* Remove from ope_longcts_send_list since operation is complete */
+	if (txe->state == EFA_RDM_OPE_SEND) {
+		dlist_remove(&txe->entry);
+	}
+
+	/*
+	 * Mark that the remote ack (RECEIPT) has arrived.
+	 * The txe is released either here or in
+	 * efa_rdm_pke_handle_send_completion() for the DC
+	 * request/CTSDATA packet, whichever happens last.
+	 * Release here if the send completion already arrived.
+	 */
+	txe->internal_flags |= EFA_RDM_TXE_REMOTE_ACK_RECEIVED;
+	if (efa_rdm_txe_with_remote_ack_ready_for_release(txe))
+		efa_rdm_txe_release(txe);
+
+	efa_rdm_pke_release_rx(pkt_entry);
+}
+
+/* atomrsp packet related functions: init, handle_sent, handle_send_completion and recv
+ *
+ * initialize atomic response packet by creating a packet that hold original data
+ * in rxe->iov. rxe->iov will then be changed by atomic operation.
+ * release that packet entry until it is sent.
+ */
+int efa_rdm_pke_init_atomrsp(struct efa_rdm_pke *pkt_entry, struct efa_rdm_ope *rxe)
+{
+	struct efa_rdm_atomrsp_pkt *atomrsp_pkt;
+	struct efa_rdm_atomrsp_hdr *atomrsp_hdr;
+
+	assert(rxe->atomrsp_data);
+	pkt_entry->peer = rxe->peer;
+	efa_rdm_pke_set_ope(pkt_entry, rxe);
+
+	atomrsp_pkt = (struct efa_rdm_atomrsp_pkt *)pkt_entry->wiredata;
+	atomrsp_hdr = &atomrsp_pkt->hdr;
+	atomrsp_hdr->type = EFA_RDM_ATOMRSP_PKT;
+	atomrsp_hdr->version = EFA_RDM_PROTOCOL_VERSION;
+	atomrsp_hdr->flags = 0;
+	atomrsp_hdr->recv_id = rxe->tx_id;
+	atomrsp_hdr->seg_length = ofi_total_iov_len(rxe->iov, rxe->iov_count);
+	atomrsp_hdr->flags |= EFA_RDM_PKT_CONNID_HDR;
+	atomrsp_hdr->connid = efa_rdm_ep_raw_addr(rxe->ep)->qkey;
+	assert(sizeof(struct efa_rdm_atomrsp_hdr) + atomrsp_hdr->seg_length < rxe->ep->mtu_size);
+	/* rxe->atomrsp_data was filled in efa_rdm_pke_handle_req_recv() */
+	memcpy(atomrsp_pkt->data, rxe->atomrsp_data, atomrsp_hdr->seg_length);
+	pkt_entry->pkt_size = sizeof(struct efa_rdm_atomrsp_hdr) + atomrsp_hdr->seg_length;
+	return 0;
+}
+
+void efa_rdm_pke_handle_atomrsp_send_completion(struct efa_rdm_pke *pkt_entry)
+{
+	struct efa_rdm_ope *rxe;
+
+	rxe = pkt_entry->ope;
+	ofi_buf_free(rxe->atomrsp_data);
+	rxe->atomrsp_data = NULL;
+	efa_rdm_rxe_release(rxe);
+}
+
+void efa_rdm_pke_handle_atomrsp_recv(struct efa_rdm_pke *pkt_entry)
+{
+	struct efa_rdm_atomrsp_pkt *atomrsp_pkt = NULL;
+	struct efa_rdm_atomrsp_hdr *atomrsp_hdr = NULL;
+	struct efa_rdm_ope *txe = NULL;
+	ssize_t ret;
+
+	atomrsp_pkt = (struct efa_rdm_atomrsp_pkt *)pkt_entry->wiredata;
+	atomrsp_hdr = &atomrsp_pkt->hdr;
+	txe = efa_rdm_ep_live_txe_from_id(pkt_entry->ep, atomrsp_hdr->recv_id);
+	if (!txe) {
+		/* MR abort covers only msg and tagged operations, so an atomic
+		 * that went away mid-transfer leaves nothing to apply this
+		 * response to. Surface it rather than dropping quietly. */
+		EFA_WARN(FI_LOG_CQ,
+			 "ATOMRSP names ope id %" PRIu32 ", which no longer "
+			 "holds the atomic that requested it. Dropping the "
+			 "ATOMRSP. MR abort does not support atomics.\n",
+			 atomrsp_hdr->recv_id);
+		efa_base_ep_write_eq_error(&pkt_entry->ep->base_ep,
+					   FI_EOPNOTSUPP,
+					   FI_EFA_ERR_PEER_ABORTED);
+		efa_rdm_pke_release_rx(pkt_entry);
+		return;
+	}
+
+	ret = efa_copy_to_hmem_iov(txe->atomic_ex.result_desc, txe->atomic_ex.resp_iov,
+	                           txe->atomic_ex.resp_iov_count, atomrsp_pkt->data,
+	                           atomrsp_hdr->seg_length);
+	if (OFI_UNLIKELY(ret < 0)) {
+		efa_base_ep_write_eq_error(&pkt_entry->ep->base_ep, -ret, EFA_IO_COMP_STATUS_LOCAL_ERROR_BAD_LENGTH);
+		return;
+	}
+
+	if (txe->fi_flags & FI_COMPLETION)
+		efa_rdm_txe_report_completion(txe);
+	else
+		efa_cntr_report_tx_completion(&pkt_entry->ep->base_ep.util_ep, txe->cq_entry.flags);
+
+	/*
+	 * Mark that the remote response (ATOMRSP) has arrived.
+	 * The txe is released either here or in
+	 * efa_rdm_pke_handle_send_completion() for the
+	 * FETCH_RTA/COMPARE_RTA packet, whichever happens last.
+	 * Release here if the send completion already arrived.
+	 */
+	txe->internal_flags |= EFA_RDM_TXE_REMOTE_ACK_RECEIVED;
+	if (efa_rdm_txe_with_remote_ack_ready_for_release(txe))
+		efa_rdm_txe_release(txe);
+	efa_rdm_pke_release_rx(pkt_entry);
+}

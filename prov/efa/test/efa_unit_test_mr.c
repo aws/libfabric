@@ -1,0 +1,2295 @@
+/* SPDX-License-Identifier: BSD-2-Clause OR GPL-2.0-only */
+/* SPDX-FileCopyrightText: Copyright Amazon.com, Inc. or its affiliates. All rights reserved. */
+
+#include "efa_unit_tests.h"
+#include "rdm/efa_rdm_pke_nonreq.h"
+#include "rdm/efa_rdm_cq.h"
+
+static void test_efa_mr_impl(struct efa_domain *efa_domain, struct fid_mr *mr,
+			int mr_reg_count, int mr_reg_size)
+{
+	assert_int_equal(ofi_atomic_get64(&efa_domain->ibv_mr_reg_ct), (int64_t)mr_reg_count);
+	assert_int_equal(ofi_atomic_get64(&efa_domain->ibv_mr_reg_sz), (int64_t)mr_reg_size);
+}
+
+static void test_efa_rdm_mr_impl(struct efa_domain *efa_domain, struct fid_mr *mr,
+				int mr_reg_count, int mr_reg_size, bool gdrcopy_flag)
+{
+	struct efa_rdm_domain *rdm_domain = (struct efa_rdm_domain *) efa_domain;
+	struct efa_rdm_mr *efa_rdm_mr;
+
+	test_efa_mr_impl(efa_domain, mr, mr_reg_count, mr_reg_size);
+
+	if (mr) {
+		efa_rdm_mr = container_of(mr, struct efa_rdm_mr, efa_mr.mr_fid);
+
+		/* Test RDM-specific MR map insertion status */
+		assert_true(efa_rdm_mr->inserted_to_mr_map);
+
+		/* Test SHM MR creation based on domain availability */
+		if (rdm_domain->shm_domain) {
+			assert_non_null(efa_rdm_mr->shm_mr);
+		} else {
+			assert_null(efa_rdm_mr->shm_mr);
+		}
+
+		/* Test needs_sync flag for CUDA memory */
+		if (efa_rdm_mr->efa_mr.iface == FI_HMEM_CUDA) {
+			assert_true(efa_rdm_mr->needs_sync);
+		} else {
+			assert_false(efa_rdm_mr->needs_sync);
+		}
+
+		if (cuda_is_gdrcopy_enabled()) {
+			if (gdrcopy_flag) {
+				assert_true(efa_rdm_mr->flags &
+					    OFI_HMEM_DATA_DEV_REG_HANDLE);
+				assert_non_null(efa_rdm_mr->hmem_data);
+			} else {
+				assert_false(efa_rdm_mr->flags &
+					     OFI_HMEM_DATA_DEV_REG_HANDLE);
+				assert_null(efa_rdm_mr->hmem_data);
+			}
+		}
+	}
+}
+
+void test_efa_rdm_mr_reg_host_memory(void **state)
+{
+	struct efa_resource *resource = *state;
+	struct efa_domain *efa_domain;
+	size_t mr_size = 64;
+	void *buf;
+	struct fid_mr *mr = NULL;
+	int baseline_ct, baseline_sz;
+
+	efa_unit_test_resource_construct(resource, FI_EP_RDM, EFA_FABRIC_NAME);
+
+	efa_domain = container_of(resource->domain, struct efa_domain,
+				  util_domain.domain_fid);
+
+	/* fi_endpoint calls ofi_bufpool_grow, which registers mr */
+	baseline_ct = ofi_atomic_get64(&efa_domain->ibv_mr_reg_ct);
+	baseline_sz = ofi_atomic_get64(&efa_domain->ibv_mr_reg_sz);
+
+	buf = malloc(mr_size);
+	assert_non_null(buf);
+
+	assert_int_equal(fi_mr_reg(resource->domain, buf, mr_size,
+				   FI_SEND | FI_RECV, 0, 0, 0, &mr, NULL),
+			 0);
+
+	/* No GDRCopy registration for host memory */
+	test_efa_rdm_mr_impl(efa_domain, mr, baseline_ct + 1, baseline_sz + mr_size, false);
+
+	assert_int_equal(fi_close(&mr->fid), 0);
+	test_efa_rdm_mr_impl(efa_domain, NULL, baseline_ct, baseline_sz, false);
+	free(buf);
+}
+
+void test_efa_rdm_mr_reg_host_memory_no_mr_local(void **state)
+{
+	struct efa_resource *resource = *state;
+	struct fi_info *hints;
+	struct efa_domain *efa_domain;
+	size_t mr_size = 64;
+	void *buf;
+	struct fid_mr *mr = NULL;
+	int baseline_ct, baseline_sz;
+
+	hints = efa_unit_test_alloc_hints(FI_EP_RDM, EFA_FABRIC_NAME);
+	hints->domain_attr->mr_mode &= ~FI_MR_LOCAL;
+
+	efa_unit_test_resource_construct_with_hints(resource, FI_EP_RDM,
+						 FI_VERSION(2, 0), hints, true, true);
+	fi_freeinfo(hints);
+
+	efa_domain = container_of(resource->domain, struct efa_domain,
+				  util_domain.domain_fid);
+
+	/* fi_endpoint calls ofi_bufpool_grow, which registers mr */
+	baseline_ct = ofi_atomic_get64(&efa_domain->ibv_mr_reg_ct);
+	baseline_sz = ofi_atomic_get64(&efa_domain->ibv_mr_reg_sz);
+
+	buf = malloc(mr_size);
+	assert_non_null(buf);
+
+	assert_int_equal(fi_mr_reg(resource->domain, buf, mr_size,
+				   FI_SEND | FI_RECV, 0, 0, 0, &mr, NULL),
+			 0);
+
+	/* No GDRCopy registration for host memory */
+	test_efa_rdm_mr_impl(efa_domain, mr, baseline_ct + 1, baseline_sz + mr_size, false);
+
+	assert_int_equal(fi_close(&mr->fid), 0);
+	test_efa_rdm_mr_impl(efa_domain, NULL, baseline_ct, baseline_sz, false);
+	free(buf);
+}
+
+void test_efa_rdm_mr_reg_host_memory_overlapping_buffers(void **state)
+{
+	struct efa_resource *resource = *state;
+	struct efa_domain *efa_domain;
+	size_t mr_size = 1024;
+	void *buf;
+	struct fid_mr *mr_1 = NULL, *mr_2 = NULL;
+	int baseline_ct, baseline_sz;
+
+	efa_unit_test_resource_construct(resource, FI_EP_RDM, EFA_FABRIC_NAME);
+
+	efa_domain = container_of(resource->domain, struct efa_domain,
+				  util_domain.domain_fid);
+
+	/* fi_endpoint calls ofi_bufpool_grow, which registers mr */
+	baseline_ct = ofi_atomic_get64(&efa_domain->ibv_mr_reg_ct);
+	baseline_sz = ofi_atomic_get64(&efa_domain->ibv_mr_reg_sz);
+
+	buf = malloc(mr_size);
+	assert_non_null(buf);
+
+	assert_int_equal(fi_mr_reg(resource->domain, buf, mr_size,
+				   FI_SEND | FI_RECV, 0, 0, 0, &mr_1, NULL),
+			 0);
+
+	/* No GDRCopy registration for host memory */
+	test_efa_rdm_mr_impl(efa_domain, mr_1, baseline_ct + 1, baseline_sz + mr_size, false);
+
+	assert_int_equal(fi_mr_reg(resource->domain, buf, mr_size,
+				   FI_SEND | FI_RECV, 0, 0, 0, &mr_2, NULL),
+			 0);
+
+	test_efa_rdm_mr_impl(efa_domain, mr_2, baseline_ct + 2, baseline_sz + mr_size * 2, false);
+
+	assert_int_equal(fi_close(&mr_1->fid), 0);
+	test_efa_rdm_mr_impl(efa_domain, mr_2, baseline_ct + 1, baseline_sz + mr_size, false);
+
+	assert_int_equal(fi_close(&mr_2->fid), 0);
+	test_efa_rdm_mr_impl(efa_domain, NULL, baseline_ct, baseline_sz, false);
+
+	free(buf);
+}
+
+#if HAVE_CUDA
+void test_efa_rdm_mr_reg_cuda_memory(void **state)
+{
+	struct efa_resource *resource = *state;
+	struct efa_domain *efa_domain;
+	size_t mr_size = 64;
+	void *buf;
+	struct fid_mr *mr = NULL;
+	struct fi_mr_attr mr_reg_attr = { 0 };
+	struct iovec iovec;
+	int err, baseline_ct, baseline_sz;
+
+	if (hmem_ops[FI_HMEM_CUDA].initialized &&
+	    g_efa_hmem_info[FI_HMEM_CUDA].p2p_supported_by_device) {
+		resource->hints = efa_unit_test_alloc_hints_hmem(
+			FI_EP_RDM, EFA_FABRIC_NAME);
+		efa_unit_test_resource_construct_with_hints(resource, FI_EP_RDM,
+							    FI_VERSION(2, 0),
+							    resource->hints,
+							    true, true);
+
+		efa_domain = container_of(resource->domain, struct efa_domain,
+					  util_domain.domain_fid);
+		/* fi_endpoint calls ofi_bufpool_grow, which registers mr */
+		baseline_ct = ofi_atomic_get64(&efa_domain->ibv_mr_reg_ct);
+		baseline_sz = ofi_atomic_get64(&efa_domain->ibv_mr_reg_sz);
+
+		err = ofi_cudaMalloc(&buf, mr_size);
+		assert_int_equal(err, 0);
+		assert_non_null(buf);
+
+		mr_reg_attr.access = FI_SEND | FI_RECV;
+		mr_reg_attr.iface = FI_HMEM_CUDA;
+		iovec.iov_base = buf;
+		iovec.iov_len = mr_size;
+		mr_reg_attr.mr_iov = &iovec;
+		mr_reg_attr.iov_count = 1;
+
+		err = fi_mr_regattr(resource->domain, &mr_reg_attr, 0, &mr);
+		assert_int_equal(err, 0);
+
+		/* FI_MR_DMABUF flag was not set, so GDRCopy should be registered if available */
+		test_efa_rdm_mr_impl(efa_domain, mr, baseline_ct + 1, baseline_sz + mr_size, true);
+
+		assert_int_equal(fi_close(&mr->fid), 0);
+		test_efa_rdm_mr_impl(efa_domain, NULL, baseline_ct, baseline_sz, false);
+
+		err = ofi_cudaFree(buf);
+		assert_int_equal(err, 0);
+	}
+}
+#else
+void test_efa_rdm_mr_reg_cuda_memory(void **state)
+{
+	skip();
+}
+#endif
+
+#if HAVE_CUDA
+void test_efa_direct_mr_reg_cuda_memory(void **state)
+{
+	struct efa_resource *resource = *state;
+	struct efa_domain *efa_domain;
+	size_t mr_size = 64;
+	void *buf;
+	struct fid_mr *mr = NULL;
+	struct fi_mr_attr mr_reg_attr = { 0 };
+	struct iovec iovec;
+	int err, baseline_ct, baseline_sz;
+
+	if (g_efa_hmem_info[FI_HMEM_CUDA].initialized &&
+	    g_efa_hmem_info[FI_HMEM_CUDA].p2p_supported_by_device) {
+		resource->hints = efa_unit_test_alloc_hints_hmem(
+			FI_EP_RDM, EFA_DIRECT_FABRIC_NAME);
+		efa_unit_test_resource_construct_with_hints(resource, FI_EP_RDM,
+							    FI_VERSION(2, 0),
+							    resource->hints,
+							    true, true);
+
+		efa_domain = container_of(resource->domain, struct efa_domain,
+					  util_domain.domain_fid);
+		/* fi_endpoint calls ofi_bufpool_grow, which registers mr */
+		baseline_ct = ofi_atomic_get64(&efa_domain->ibv_mr_reg_ct);
+		baseline_sz = ofi_atomic_get64(&efa_domain->ibv_mr_reg_sz);
+
+		err = ofi_cudaMalloc(&buf, mr_size);
+		assert_int_equal(err, 0);
+		assert_non_null(buf);
+
+		mr_reg_attr.access = FI_SEND | FI_RECV;
+		mr_reg_attr.iface = FI_HMEM_CUDA;
+		iovec.iov_base = buf;
+		iovec.iov_len = mr_size;
+		mr_reg_attr.mr_iov = &iovec;
+		mr_reg_attr.iov_count = 1;
+
+		err = fi_mr_regattr(resource->domain, &mr_reg_attr, 0, &mr);
+		assert_int_equal(err, 0);
+
+		test_efa_mr_impl(efa_domain, mr, baseline_ct + 1, baseline_sz + mr_size);
+
+		assert_int_equal(fi_close(&mr->fid), 0);
+		test_efa_mr_impl(efa_domain, NULL, baseline_ct, baseline_sz);
+
+		err = ofi_cudaFree(buf);
+		assert_int_equal(err, 0);
+	}
+}
+#else
+void test_efa_direct_mr_reg_cuda_memory(void **state)
+{
+	skip();
+}
+#endif
+
+void test_efa_direct_mr_reg_rdma_read_not_supported(void **state)
+{
+	struct efa_resource *resource = *state;
+	struct efa_domain *efa_domain;
+	size_t mr_size = 64;
+	void *buf;
+	struct fid_mr *mr = NULL;
+	struct fi_mr_attr mr_reg_attr = {0};
+	struct iovec iovec;
+	int err;
+	uint32_t efa_device_caps_orig;
+
+	resource->hints = efa_unit_test_alloc_hints(FI_EP_RDM, EFA_DIRECT_FABRIC_NAME);
+	efa_unit_test_resource_construct_with_hints(resource, FI_EP_RDM,
+						    FI_VERSION(2, 0),
+						    resource->hints,
+						    true, true);
+
+	efa_domain = container_of(resource->domain, struct efa_domain,
+				  util_domain.domain_fid);
+
+	/* Mock device to not support RDMA read */
+	efa_device_caps_orig = efa_domain->device->device_caps;
+	efa_domain->device->device_caps &= ~EFADV_DEVICE_ATTR_CAPS_RDMA_READ;
+
+	buf = malloc(mr_size);
+	assert_non_null(buf);
+
+	mr_reg_attr.access = FI_READ;
+	mr_reg_attr.iface = FI_HMEM_SYSTEM;
+	iovec.iov_base = buf;
+	iovec.iov_len = mr_size;
+	mr_reg_attr.mr_iov = &iovec;
+	mr_reg_attr.iov_count = 1;
+
+	err = fi_mr_regattr(resource->domain, &mr_reg_attr, 0, &mr);
+	assert_int_equal(err, -FI_EOPNOTSUPP);
+
+	free(buf);
+	efa_domain->device->device_caps = efa_device_caps_orig;
+}
+
+void test_efa_direct_mr_reg_rdma_write_not_supported(void **state)
+{
+	struct efa_resource *resource = *state;
+	struct efa_domain *efa_domain;
+	size_t mr_size = 64;
+	void *buf;
+	struct fid_mr *mr = NULL;
+	struct fi_mr_attr mr_reg_attr = {0};
+	struct iovec iovec;
+	int err;
+	uint32_t efa_device_caps_orig;
+
+	resource->hints = efa_unit_test_alloc_hints(FI_EP_RDM, EFA_DIRECT_FABRIC_NAME);
+	efa_unit_test_resource_construct_with_hints(resource, FI_EP_RDM,
+						    FI_VERSION(2, 0),
+						    resource->hints,
+						    true, true);
+
+	efa_domain = container_of(resource->domain, struct efa_domain,
+				  util_domain.domain_fid);
+
+	efa_device_caps_orig = efa_domain->device->device_caps;
+	/* Mock device to not support RDMA write */
+#if HAVE_CAPS_RDMA_WRITE
+	efa_domain->device->device_caps &= ~EFADV_DEVICE_ATTR_CAPS_RDMA_WRITE;
+#endif
+
+	buf = malloc(mr_size);
+	assert_non_null(buf);
+
+	mr_reg_attr.access = FI_WRITE;
+	mr_reg_attr.iface = FI_HMEM_SYSTEM;
+	iovec.iov_base = buf;
+	iovec.iov_len = mr_size;
+	mr_reg_attr.mr_iov = &iovec;
+	mr_reg_attr.iov_count = 1;
+
+	err = fi_mr_regattr(resource->domain, &mr_reg_attr, 0, &mr);
+	assert_int_equal(err, -FI_EOPNOTSUPP);
+
+	free(buf);
+	efa_domain->device->device_caps = efa_device_caps_orig;
+}
+
+void test_efa_mr_validate_regattr_invalid_iov_count(void **state)
+{
+	struct efa_resource *resource = *state;
+	struct fi_mr_attr mr_attr = { 0 };
+	struct iovec iov[2];
+	void *buf1, *buf2;
+	size_t mr_size = 64;
+	struct fid_mr *mr = NULL;
+	int ret;
+
+	efa_unit_test_resource_construct(resource, FI_EP_RDM, EFA_FABRIC_NAME);
+
+	buf1 = malloc(mr_size);
+	buf2 = malloc(mr_size);
+	assert_non_null(buf1);
+	assert_non_null(buf2);
+
+	iov[0].iov_base = buf1;
+	iov[0].iov_len = mr_size;
+	iov[1].iov_base = buf2;
+	iov[1].iov_len = mr_size;
+	mr_attr.mr_iov = iov;
+	mr_attr.iov_count = 2; /* Exceeds EFA_MR_IOV_LIMIT */
+	mr_attr.access = FI_SEND | FI_RECV;
+	mr_attr.iface = FI_HMEM_SYSTEM;
+
+	/* Test through the actual API */
+	ret = fi_mr_regattr(resource->domain, &mr_attr, 0, &mr);
+	assert_int_equal(ret, -FI_EINVAL);
+	assert_null(mr);
+
+	free(buf1);
+	free(buf2);
+}
+
+void test_efa_mr_validate_regattr_uninitialized_iface(void **state)
+{
+	struct efa_resource *resource = *state;
+	struct fi_mr_attr mr_attr = { 0 };
+	struct iovec iov;
+	void *buf;
+	size_t mr_size = 64;
+	struct fid_mr *mr = NULL;
+	int ret;
+
+	efa_unit_test_resource_construct(resource, FI_EP_RDM, EFA_FABRIC_NAME);
+
+	buf = malloc(mr_size);
+	assert_non_null(buf);
+
+	iov.iov_base = buf;
+	iov.iov_len = mr_size;
+	mr_attr.mr_iov = &iov;
+	mr_attr.iov_count = 1;
+	mr_attr.access = FI_SEND | FI_RECV;
+	mr_attr.iface = FI_HMEM_CUDA;
+
+	/* Mock CUDA as uninitialized by temporarily setting it to false */
+	g_efa_hmem_info[FI_HMEM_CUDA].initialized = false;
+
+	/* Test through the actual API */
+	ret = fi_mr_regattr(resource->domain, &mr_attr, 0, &mr);
+	assert_int_equal(ret, -FI_ENOSYS);
+	assert_null(mr);
+
+	free(buf);
+}
+
+/**
+ * @brief Test RDM MR structure casting safety
+ */
+void test_efa_rdm_mr_structure_casting(void **state)
+{
+	struct efa_resource *resource = *state;
+	struct efa_domain *efa_domain;
+	size_t mr_size = 64;
+	void *buf;
+	struct fid_mr *mr = NULL;
+	struct efa_mr *efa_mr;
+	struct efa_rdm_mr *efa_rdm_mr;
+
+	efa_unit_test_resource_construct(resource, FI_EP_RDM, EFA_FABRIC_NAME);
+
+	efa_domain = container_of(resource->domain, struct efa_domain,
+				  util_domain.domain_fid);
+
+				  buf = malloc(mr_size);
+	assert_non_null(buf);
+
+	assert_int_equal(fi_mr_reg(resource->domain, buf, mr_size,
+				   FI_SEND | FI_RECV, 0, 0, 0, &mr, NULL),
+			 0);
+
+	/* Test safe casting from fid_mr to efa_mr */
+	efa_mr = container_of(mr, struct efa_mr, mr_fid);
+	assert_non_null(efa_mr);
+	assert_ptr_equal(efa_mr->domain, efa_domain);
+	assert_int_equal(efa_mr->iface, FI_HMEM_SYSTEM);
+
+	/* Test safe casting from efa_mr to efa_rdm_mr */
+	efa_rdm_mr = (struct efa_rdm_mr *)efa_mr;
+	assert_non_null(efa_rdm_mr);
+	/* Verify that efa_mr is the first member */
+	assert_ptr_equal(&efa_rdm_mr->efa_mr, efa_mr);
+	assert_ptr_equal(efa_rdm_mr->efa_mr.domain, efa_domain);
+	assert_int_equal(efa_rdm_mr->efa_mr.iface, FI_HMEM_SYSTEM);
+
+	assert_int_equal(fi_close(&mr->fid), 0);
+	free(buf);
+}
+
+/**
+ * @brief Test EFA_MR_ATTR_INIT_SYSTEM macro
+ */
+void test_efa_mr_attr_init_system_macro(void **state)
+{
+	struct iovec iov;
+	void *buf;
+	size_t mr_size = 64;
+	uint64_t access = FI_SEND | FI_RECV;
+	uint64_t offset = 0;
+	uint64_t requested_key = 123;
+	void *context = (void *)0xdeadbeef;
+
+	buf = malloc(mr_size);
+	assert_non_null(buf);
+
+	iov.iov_base = buf;
+	iov.iov_len = mr_size;
+
+	/* Test the macro by initializing a new struct */
+	struct fi_mr_attr mr_attr = EFA_MR_ATTR_INIT_SYSTEM(&iov, 1, access, offset, requested_key, context);
+
+	assert_ptr_equal(mr_attr.mr_iov, &iov);
+	assert_int_equal(mr_attr.iov_count, 1);
+	assert_int_equal(mr_attr.access, access);
+	assert_int_equal(mr_attr.offset, offset);
+	assert_int_equal(mr_attr.requested_key, requested_key);
+	assert_ptr_equal(mr_attr.context, context);
+	assert_int_equal(mr_attr.iface, FI_HMEM_SYSTEM);
+
+	free(buf);
+}
+
+/**
+ * @brief Test efa_mr_ofi_to_ibv_access with no access flags
+ *
+ * When no access flags are provided, the function should default to
+ * FI_SEND | FI_RECV and return IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ.
+ */
+void test_efa_mr_ofi_to_ibv_access_no_access(void **state)
+{
+	int ibv_access;
+
+	ibv_access = efa_mr_ofi_to_ibv_access(0, true, true, 0);
+	assert_int_equal(ibv_access, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ);
+}
+
+/**
+ * @brief Test efa_mr_ofi_to_ibv_access with one flag when rdma read and write are available
+ *
+ */
+void test_efa_mr_ofi_to_ibv_access_one_flag(void **state)
+{
+	int ibv_access;
+
+	ibv_access = efa_mr_ofi_to_ibv_access(FI_SEND, true, true, 0);
+	assert_int_equal(ibv_access, IBV_ACCESS_REMOTE_READ);
+
+	ibv_access = efa_mr_ofi_to_ibv_access(FI_RECV, true, true, 0);
+	assert_int_equal(ibv_access, IBV_ACCESS_LOCAL_WRITE);
+
+	ibv_access = efa_mr_ofi_to_ibv_access(FI_READ, true, true, 0);
+	assert_int_equal(ibv_access, IBV_ACCESS_LOCAL_WRITE);
+
+	ibv_access = efa_mr_ofi_to_ibv_access(FI_WRITE, true, true, 0);
+	assert_int_equal(ibv_access, 0);
+
+	ibv_access = efa_mr_ofi_to_ibv_access(FI_REMOTE_READ, true, true, 0);
+	assert_int_equal(ibv_access, IBV_ACCESS_REMOTE_READ);
+
+	ibv_access = efa_mr_ofi_to_ibv_access(FI_REMOTE_WRITE, true, true, 0);
+	assert_int_equal(ibv_access, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+}
+
+/**
+ * @brief Test efa_mr_ofi_to_ibv_access when RDMA read not supported
+ */
+void test_efa_mr_ofi_to_ibv_access_read_not_supported(void **state)
+{
+	int ibv_access;
+
+	ibv_access = efa_mr_ofi_to_ibv_access(FI_READ, false, false, 0);
+	assert_int_equal(ibv_access, 0);
+
+	ibv_access = efa_mr_ofi_to_ibv_access(FI_REMOTE_READ, false, false, 0);
+	assert_int_equal(ibv_access, 0);
+}
+
+/**
+ * @brief Test efa_mr_ofi_to_ibv_access when RDMA write not supported
+ *
+ * When device doesn't support RDMA write, emulate with RDMA read
+ */
+void test_efa_mr_ofi_to_ibv_access_write_not_supported(void **state)
+{
+	int ibv_access;
+
+	ibv_access = efa_mr_ofi_to_ibv_access(FI_WRITE, true, false, 0);
+	assert_int_equal(ibv_access, IBV_ACCESS_REMOTE_READ);
+
+	ibv_access = efa_mr_ofi_to_ibv_access(FI_REMOTE_WRITE, true, false, 0);
+	assert_int_equal(ibv_access, IBV_ACCESS_LOCAL_WRITE);
+}
+
+/**
+ * @brief Test efa_mr_ofi_to_ibv_access with FI_REMOTE_READ | FI_REMOTE_WRITE,
+ * only read supported
+ *
+ * When only remote read is supported, FI_REMOTE_READ gets IBV_ACCESS_REMOTE_READ
+ * and FI_REMOTE_WRITE gets IBV_ACCESS_LOCAL_WRITE.
+ */
+void test_efa_mr_ofi_to_ibv_access_remote_read_write_read_only_supported(void **state)
+{
+	int ibv_access;
+
+	ibv_access = efa_mr_ofi_to_ibv_access(FI_REMOTE_READ | FI_REMOTE_WRITE, true, false, 0);
+	assert_int_equal(ibv_access, IBV_ACCESS_REMOTE_READ | IBV_ACCESS_LOCAL_WRITE);
+}
+
+/**
+ * @brief Test efa_mr_ofi_to_ibv_access with all access flags combined
+ *
+ * Test all OFI access flags together with full device support.
+ */
+void test_efa_mr_ofi_to_ibv_access_all_flags_supported(void **state)
+{
+	int ibv_access;
+	uint64_t all_flags = FI_SEND | FI_RECV | FI_READ | FI_WRITE | FI_REMOTE_READ | FI_REMOTE_WRITE;
+
+	ibv_access = efa_mr_ofi_to_ibv_access(all_flags, true, true, 0);
+	assert_int_equal(ibv_access, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE);
+}
+
+/**
+ * @brief Test efa_mr_ofi_to_ibv_access with all access flags, no device support
+ */
+void test_efa_mr_ofi_to_ibv_access_all_flags_not_supported(void **state)
+{
+	int ibv_access;
+	uint64_t all_flags = FI_SEND | FI_RECV | FI_READ | FI_WRITE | FI_REMOTE_READ | FI_REMOTE_WRITE;
+
+	ibv_access = efa_mr_ofi_to_ibv_access(all_flags, false, false, 0);
+	assert_int_equal(ibv_access, IBV_ACCESS_LOCAL_WRITE);
+}
+
+/**
+ * @brief Verify the efa-direct ope pools cap each direction separately.
+ */
+void test_efa_direct_ope_pools_capped(void **state)
+{
+	struct efa_resource *resource = *state;
+	struct efa_base_ep *base_ep;
+	struct efa_direct_ope **ope;
+	size_t i, allocated, max_txe, max_rxe;
+
+	efa_env.track_mr = 1;
+
+	efa_unit_test_resource_construct(resource, FI_EP_RDM,
+					 EFA_DIRECT_FABRIC_NAME);
+	base_ep = container_of(resource->ep, struct efa_base_ep,
+			       util_ep.ep_fid);
+
+	/* each pool is capped at the QP's own depth for that direction */
+	max_txe = efa_base_ep_get_tx_pool_size(base_ep);
+	max_rxe = efa_base_ep_get_rx_pool_size(base_ep);
+	assert_true(max_txe > 0);
+	assert_true(max_rxe > 0);
+
+	ope = calloc(MAX(max_txe, max_rxe) + 1, sizeof(*ope));
+	assert_non_null(ope);
+
+	for (allocated = 0; allocated < max_txe + 1; allocated++) {
+		ope[allocated] = ofi_buf_alloc(base_ep->txe_pool);
+		if (!ope[allocated])
+			break;
+	}
+	assert_int_equal(allocated, max_txe);
+	for (i = 0; i < allocated; i++)
+		ofi_buf_free(ope[i]);
+
+	for (allocated = 0; allocated < max_rxe + 1; allocated++) {
+		ope[allocated] = ofi_buf_alloc(base_ep->rxe_pool);
+		if (!ope[allocated])
+			break;
+	}
+	assert_int_equal(allocated, max_rxe);
+	for (i = 0; i < allocated; i++)
+		ofi_buf_free(ope[i]);
+
+	free(ope);
+
+	/* Close ep before restoring track_mr so efa_ep_close tears the pools
+	 * down the same way it created them. */
+	assert_int_equal(fi_close(&resource->ep->fid), 0);
+	resource->ep = NULL;
+	efa_env.track_mr = 0;
+}
+
+/**
+ * @brief Test that closing an MR with outstanding direct operations prints
+ * warning and clears the desc reference.
+ *
+ * When FI_EFA_TRACK_MR is enabled and an MR is closed while a direct
+ * operation still references it, efa_mr_close will warn and clear the desc entry.
+ */
+void test_efa_mr_close_warn_outstanding_direct_ope(void **state)
+{
+	struct efa_resource *resource = *state;
+	struct efa_base_ep *base_ep;
+	struct efa_direct_ope *direct_ope;
+	struct fid_mr *mr = NULL;
+	struct efa_mr *efa_mr;
+	size_t mr_size = 64;
+	void *buf;
+
+	efa_env.track_mr = 1;
+
+	efa_unit_test_resource_construct(resource, FI_EP_RDM, EFA_DIRECT_FABRIC_NAME);
+
+	base_ep = container_of(resource->ep, struct efa_base_ep,
+			       util_ep.ep_fid);
+
+	buf = malloc(mr_size);
+	assert_non_null(buf);
+
+	assert_int_equal(fi_mr_reg(resource->domain, buf, mr_size,
+				   FI_SEND | FI_RECV, 0, 0, 0, &mr, NULL), 0);
+	efa_mr = container_of(mr, struct efa_mr, mr_fid);
+
+	/* Simulate an outstanding direct operation referencing this MR */
+	direct_ope = ofi_buf_alloc(base_ep->txe_pool);
+	assert_non_null(direct_ope);
+	direct_ope->iov_count = 1;
+	direct_ope->desc[0] = efa_mr;
+	dlist_insert_tail(&direct_ope->entry, &base_ep->ope_list);
+
+	/* Close MR while operation is outstanding */
+	assert_int_equal(fi_close(&mr->fid), 0);
+
+	/* Verify desc was cleared */
+	assert_null(direct_ope->desc[0]);
+
+	/* Clean up the outstanding ope */
+	dlist_remove(&direct_ope->entry);
+	ofi_buf_free(direct_ope);
+
+	free(buf);
+
+	/* Close ep before restoring track_mr so efa_ep_close sees track_mr=1
+	 * and destroys the direct ope pool. */
+	assert_int_equal(fi_close(&resource->ep->fid), 0);
+	resource->ep = NULL;
+}
+
+/**
+ * @brief Test MR close with outstanding direct operations on multiple EPs
+ *
+ * Two EPs share one MR. Each EP has an in-flight direct operation referencing
+ * the MR. Closing the MR should warn and clear desc on both EPs.
+ */
+void test_efa_mr_close_warn_outstanding_direct_ope_multi_ep(void **state)
+{
+	struct efa_resource *resource = *state;
+	struct efa_base_ep *base_ep1, *base_ep2;
+	struct efa_direct_ope *direct_ope1, *direct_ope2;
+	struct fid_ep *ep2;
+	struct fid_mr *mr = NULL;
+	struct efa_mr *efa_mr;
+	size_t mr_size = 64;
+	void *buf;
+
+	efa_env.track_mr = 1;
+
+	efa_unit_test_resource_construct(resource, FI_EP_RDM, EFA_DIRECT_FABRIC_NAME);
+
+	base_ep1 = container_of(resource->ep, struct efa_base_ep,
+				util_ep.ep_fid);
+
+	/* Create and enable a second EP on the same domain and CQ */
+	assert_int_equal(fi_endpoint(resource->domain, resource->info, &ep2, NULL), 0);
+	assert_int_equal(fi_ep_bind(ep2, &resource->cq->fid, FI_SEND | FI_RECV), 0);
+	assert_int_equal(fi_enable(ep2), 0);
+	base_ep2 = container_of(ep2, struct efa_base_ep, util_ep.ep_fid);
+
+	buf = malloc(mr_size);
+	assert_non_null(buf);
+
+	assert_int_equal(fi_mr_reg(resource->domain, buf, mr_size,
+				   FI_SEND | FI_RECV, 0, 0, 0, &mr, NULL), 0);
+	efa_mr = container_of(mr, struct efa_mr, mr_fid);
+
+	/* Simulate outstanding direct operations on both EPs referencing the same MR */
+	direct_ope1 = ofi_buf_alloc(base_ep1->txe_pool);
+	assert_non_null(direct_ope1);
+	direct_ope1->iov_count = 1;
+	direct_ope1->desc[0] = efa_mr;
+	dlist_insert_tail(&direct_ope1->entry, &base_ep1->ope_list);
+
+	direct_ope2 = ofi_buf_alloc(base_ep2->txe_pool);
+	assert_non_null(direct_ope2);
+	direct_ope2->iov_count = 1;
+	direct_ope2->desc[0] = efa_mr;
+	dlist_insert_tail(&direct_ope2->entry, &base_ep2->ope_list);
+
+	/* Close MR while operations are outstanding on both EPs */
+	assert_int_equal(fi_close(&mr->fid), 0);
+
+	/* Verify desc was cleared on both EPs */
+	assert_null(direct_ope1->desc[0]);
+	assert_null(direct_ope2->desc[0]);
+
+	/* Clean up */
+	dlist_remove(&direct_ope1->entry);
+	ofi_buf_free(direct_ope1);
+	dlist_remove(&direct_ope2->entry);
+	ofi_buf_free(direct_ope2);
+
+	assert_int_equal(fi_close(&ep2->fid), 0);
+	free(buf);
+
+	/* Close ep before restoring track_mr so efa_ep_close sees track_mr=1
+	 * and destroys the direct ope pool. */
+	assert_int_equal(fi_close(&resource->ep->fid), 0);
+	resource->ep = NULL;
+}
+
+/**
+ * @brief Test that closing an MR with outstanding RDM txe prints
+ * warning and clears the desc reference.
+ *
+ * When FI_EFA_TRACK_MR is enabled and an MR is closed while an RDM
+ * TX operation still references it, efa_mr_close will warn and clear the desc entry.
+ */
+void test_efa_mr_close_warn_outstanding_rdm_txe(void **state)
+{
+	struct efa_resource *resource = *state;
+	struct efa_rdm_ope *txe;
+	struct fid_mr *mr = NULL;
+	struct efa_mr *efa_mr;
+	size_t mr_size = 64;
+	void *buf;
+
+	efa_env.track_mr = 1;
+
+	efa_unit_test_resource_construct(resource, FI_EP_RDM, EFA_FABRIC_NAME);
+
+	buf = malloc(mr_size);
+	assert_non_null(buf);
+
+	assert_int_equal(fi_mr_reg(resource->domain, buf, mr_size,
+				   FI_SEND | FI_RECV, 0, 0, 0, &mr, NULL), 0);
+	efa_mr = container_of(mr, struct efa_mr, mr_fid);
+
+	/* Allocate a txe and set its desc to reference the MR */
+	txe = efa_unit_test_alloc_txe(resource, ofi_op_msg);
+	assert_non_null(txe);
+	txe->iov_count = 1;
+	txe->desc[0] = efa_mr;
+
+	/* Close MR while txe is outstanding */
+	assert_int_equal(fi_close(&mr->fid), 0);
+
+	/* Verify desc was cleared */
+	assert_null(txe->desc[0]);
+
+	/* Clean up the txe */
+	efa_rdm_txe_release(txe);
+
+	free(buf);
+}
+
+/**
+ * @brief Test efa_rdm_mr_cache_regv with cache disabled
+ *
+ * This test verifies that efa_rdm_mr_cache_regv properly handles the no-cache
+ * scenario by falling back to internal registration and creates the expected
+ * MR structure without cache entries.
+ */
+void test_efa_rdm_mr_cache_regv_no_cache(void **state)
+{
+	struct efa_resource *resource = *state;
+	struct fi_info *hints;
+	struct efa_domain *efa_domain;
+	size_t mr_size = 64;
+	void *buf;
+	struct fid_mr *mr = NULL;
+	struct efa_rdm_mr *efa_rdm_mr;
+	struct iovec iov;
+
+	/* Create domain with cache disabled (FI_MR_LOCAL) */
+	hints = efa_unit_test_alloc_hints(FI_EP_RDM, EFA_FABRIC_NAME);
+	hints->domain_attr->mr_mode |= FI_MR_LOCAL;
+
+	efa_unit_test_resource_construct_with_hints(resource, FI_EP_RDM,
+						    FI_VERSION(2, 0), hints, true, true);
+
+	efa_domain = container_of(resource->domain, struct efa_domain,
+				  util_domain.domain_fid);
+	struct efa_rdm_domain *rdm_domain = (struct efa_rdm_domain *) efa_domain;
+
+	/* Verify cache is not available */
+	assert_null(rdm_domain->cache);
+	assert_false(efa_is_cache_available(rdm_domain));
+
+	buf = malloc(mr_size);
+	assert_non_null(buf);
+
+	iov.iov_base = buf;
+	iov.iov_len = mr_size;
+
+	assert_int_equal(efa_rdm_mr_cache_regv(resource->domain, &iov, 1,
+					      FI_SEND | FI_RECV, 0, 0, 0, &mr, NULL),
+			 0);
+	assert_non_null(mr);
+
+	efa_rdm_mr = container_of(mr, struct efa_rdm_mr, efa_mr.mr_fid);
+	/* Verify that shm_mr is NULL even if shm_domain exists */
+	assert_null(efa_rdm_mr->shm_mr);
+
+	/* Verify no cache entry since cache is disabled */
+	assert_null(efa_rdm_mr->entry);
+	/* Verify MR is inserted to domain map */
+	assert_true(efa_rdm_mr->inserted_to_mr_map);
+
+	assert_int_equal(fi_close(&mr->fid), 0);
+	free(buf);
+	fi_freeinfo(hints);
+}
+
+/**
+ * @brief Test efa_rdm_mr_cache_regv with cache enabled
+ *
+ * This test validates that efa_rdm_mr_cache_regv properly uses the MR cache
+ * when it's available and creates the expected MR structure.
+ */
+void test_efa_rdm_mr_cache_regv_with_cache(void **state)
+{
+#ifdef ENABLE_ASAN
+	skip();
+#else
+	struct efa_resource *resource = *state;
+	struct efa_domain *efa_domain;
+	struct fid_mr *mr = NULL;
+	struct efa_rdm_mr *efa_rdm_mr;
+	struct iovec iov;
+	size_t mr_size = 64;
+	void *buf;
+	int ret;
+
+	/* Create domain with cache enabled (no FI_MR_LOCAL) */
+	struct fi_info *hints = efa_unit_test_alloc_hints(FI_EP_RDM, EFA_FABRIC_NAME);
+	hints->domain_attr->mr_mode &= ~FI_MR_LOCAL;
+
+	efa_unit_test_resource_construct_with_hints(resource, FI_EP_RDM,
+						    FI_VERSION(2, 0), hints, true, true);
+
+	efa_domain = container_of(resource->domain, struct efa_domain,
+				  util_domain.domain_fid);
+	struct efa_rdm_domain *rdm_domain = (struct efa_rdm_domain *) efa_domain;
+
+	/* Verify cache is available */
+	assert_non_null(rdm_domain->cache);
+	assert_true(efa_is_cache_available(rdm_domain));
+
+	buf = malloc(mr_size);
+	assert_non_null(buf);
+
+	iov.iov_base = buf;
+	iov.iov_len = mr_size;
+
+	/* Test efa_rdm_mr_cache_regv with cache available */
+	ret = efa_rdm_mr_cache_regv(resource->domain, &iov, 1,
+				    FI_SEND | FI_RECV, 0, 0, 0, &mr, NULL);
+	assert_int_equal(ret, 0);
+	assert_non_null(mr);
+
+	/* Verify it's an efa_rdm_mr from cache */
+	efa_rdm_mr = container_of(mr, struct efa_rdm_mr, efa_mr.mr_fid);
+	assert_non_null(efa_rdm_mr->entry); /* Should have cache entry */
+	assert_true(efa_rdm_mr->inserted_to_mr_map);
+	assert_ptr_equal(efa_rdm_mr->efa_mr.domain, efa_domain);
+
+	assert_int_equal(fi_close(&mr->fid), 0);
+	free(buf);
+#endif
+}
+
+/**
+ * @brief Test efa_rdm_mr_cache_regv cache hit scenario
+ *
+ * This test validates that multiple registrations of the same buffer
+ * result in cache hits when cache is enabled.
+ */
+void test_efa_rdm_mr_cache_regv_cache_hit(void **state)
+{
+#ifdef ENABLE_ASAN
+	skip();
+#else
+	struct efa_resource *resource = *state;
+	struct efa_domain *efa_domain;
+	struct fid_mr *mr1 = NULL, *mr2 = NULL;
+	struct efa_rdm_mr *efa_rdm_mr1, *efa_rdm_mr2;
+	struct iovec iov;
+	size_t mr_size = 64;
+	void *buf;
+	int ret;
+
+	/* Create domain with cache enabled */
+	struct fi_info *hints = efa_unit_test_alloc_hints(FI_EP_RDM, EFA_FABRIC_NAME);
+	hints->domain_attr->mr_mode &= ~FI_MR_LOCAL;
+
+	efa_unit_test_resource_construct_with_hints(resource, FI_EP_RDM,
+						    FI_VERSION(2, 0), hints, true, true);
+
+	efa_domain = container_of(resource->domain, struct efa_domain,
+				  util_domain.domain_fid);
+	struct efa_rdm_domain *rdm_domain = (struct efa_rdm_domain *) efa_domain;
+
+	/* Verify cache is available */
+	assert_non_null(rdm_domain->cache);
+
+	buf = malloc(mr_size);
+	assert_non_null(buf);
+
+	iov.iov_base = buf;
+	iov.iov_len = mr_size;
+
+	/* First registration - should create cache entry */
+	ret = efa_rdm_mr_cache_regv(resource->domain, &iov, 1,
+				    FI_SEND | FI_RECV, 0, 0, 0, &mr1, NULL);
+	assert_int_equal(ret, 0);
+	assert_non_null(mr1);
+
+	efa_rdm_mr1 = container_of(mr1, struct efa_rdm_mr, efa_mr.mr_fid);
+	assert_non_null(efa_rdm_mr1->entry);
+
+	/* Second registration of same buffer - should hit cache */
+	ret = efa_rdm_mr_cache_regv(resource->domain, &iov, 1,
+				    FI_SEND | FI_RECV, 0, 0, 0, &mr2, NULL);
+	assert_int_equal(ret, 0);
+	assert_non_null(mr2);
+
+	efa_rdm_mr2 = container_of(mr2, struct efa_rdm_mr, efa_mr.mr_fid);
+	assert_non_null(efa_rdm_mr2->entry);
+
+	/* Both should reference the same cache entry */
+	assert_ptr_equal(efa_rdm_mr1->entry, efa_rdm_mr2->entry);
+
+	assert_int_equal(fi_close(&mr1->fid), 0);
+	assert_int_equal(fi_close(&mr2->fid), 0);
+	free(buf);
+#endif
+}
+
+/**
+ * @brief Test MR cache encapsulation behavior - smaller region within larger cached region
+ *
+ * New registration is smaller and fully encapsulated within a previous region.
+ * The reference count should be incremented and the same cache entry returned.
+ */
+void test_efa_rdm_mr_cache_encapsulation_smaller(void **state)
+{
+#ifdef ENABLE_ASAN
+	skip();
+#else
+	struct efa_resource *resource = *state;
+	struct fid_mr *mr_large = NULL, *mr_small = NULL;
+	struct efa_rdm_mr *efa_rdm_mr_large, *efa_rdm_mr_small;
+	struct iovec iov_large, iov_small;
+	size_t large_size = 1024, small_size = 256;
+	void *buf;
+	int ret;
+
+	/* Create domain with cache enabled */
+	struct fi_info *hints = efa_unit_test_alloc_hints(FI_EP_RDM, EFA_FABRIC_NAME);
+	hints->domain_attr->mr_mode &= ~FI_MR_LOCAL;
+
+	efa_unit_test_resource_construct_with_hints(resource, FI_EP_RDM,
+						    FI_VERSION(2, 0), hints, true, true);
+
+	buf = malloc(large_size);
+	assert_non_null(buf);
+
+	/* Register large region first */
+	iov_large.iov_base = buf;
+	iov_large.iov_len = large_size;
+
+	ret = efa_rdm_mr_cache_regv(resource->domain, &iov_large, 1,
+				    FI_SEND | FI_RECV, 0, 0, 0, &mr_large, NULL);
+	assert_int_equal(ret, 0);
+	assert_non_null(mr_large);
+
+	efa_rdm_mr_large = container_of(mr_large, struct efa_rdm_mr, efa_mr.mr_fid);
+	assert_non_null(efa_rdm_mr_large->entry);
+
+	/* Register smaller region within the large region */
+	iov_small.iov_base = (char *)buf + 100; /* Offset within large region */
+	iov_small.iov_len = small_size;
+
+	ret = efa_rdm_mr_cache_regv(resource->domain, &iov_small, 1,
+				    FI_SEND | FI_RECV, 0, 0, 0, &mr_small, NULL);
+	assert_int_equal(ret, 0);
+	assert_non_null(mr_small);
+
+	efa_rdm_mr_small = container_of(mr_small, struct efa_rdm_mr, efa_mr.mr_fid);
+	assert_non_null(efa_rdm_mr_small->entry);
+
+	/* Both should reference the same cache entry (encapsulation) */
+	assert_ptr_equal(efa_rdm_mr_large->entry, efa_rdm_mr_small->entry);
+
+	assert_int_equal(fi_close(&mr_large->fid), 0);
+	assert_int_equal(fi_close(&mr_small->fid), 0);
+	free(buf);
+#endif
+}
+
+/**
+ * @brief Test MR cache non-overlapping regions behavior
+ *
+ * New registration and previous registrations have no full encapsulations.
+ * A new registration should be created with reference count of 1.
+ */
+void test_efa_rdm_mr_cache_non_overlapping(void **state)
+{
+#ifdef ENABLE_ASAN
+	skip();
+#else
+	struct efa_resource *resource = *state;
+	struct fid_mr *mr1 = NULL, *mr2 = NULL;
+	struct efa_rdm_mr *efa_rdm_mr1, *efa_rdm_mr2;
+	struct iovec iov1, iov2;
+	size_t mr_size = 256;
+	void *buf1, *buf2;
+	int ret;
+
+	/* Create domain with cache enabled */
+	struct fi_info *hints = efa_unit_test_alloc_hints(FI_EP_RDM, EFA_FABRIC_NAME);
+	hints->domain_attr->mr_mode &= ~FI_MR_LOCAL;
+
+	efa_unit_test_resource_construct_with_hints(resource, FI_EP_RDM,
+						    FI_VERSION(2, 0), hints, true, true);
+
+	/* Allocate two separate, non-overlapping buffers */
+	buf1 = malloc(mr_size);
+	buf2 = malloc(mr_size);
+	assert_non_null(buf1);
+	assert_non_null(buf2);
+
+	/* Ensure buffers are non-overlapping by checking addresses */
+	assert_true((char *)buf1 + mr_size <= (char *)buf2 ||
+		    (char *)buf2 + mr_size <= (char *)buf1);
+
+	/* Register first region */
+	iov1.iov_base = buf1;
+	iov1.iov_len = mr_size;
+
+	ret = efa_rdm_mr_cache_regv(resource->domain, &iov1, 1,
+				    FI_SEND | FI_RECV, 0, 0, 0, &mr1, NULL);
+	assert_int_equal(ret, 0);
+	assert_non_null(mr1);
+
+	efa_rdm_mr1 = container_of(mr1, struct efa_rdm_mr, efa_mr.mr_fid);
+	assert_non_null(efa_rdm_mr1->entry);
+
+	/* Register second, non-overlapping region */
+	iov2.iov_base = buf2;
+	iov2.iov_len = mr_size;
+
+	ret = efa_rdm_mr_cache_regv(resource->domain, &iov2, 1,
+				    FI_SEND | FI_RECV, 0, 0, 0, &mr2, NULL);
+	assert_int_equal(ret, 0);
+	assert_non_null(mr2);
+
+	efa_rdm_mr2 = container_of(mr2, struct efa_rdm_mr, efa_mr.mr_fid);
+	assert_non_null(efa_rdm_mr2->entry);
+
+	/* Should have different cache entries (non-overlapping) */
+	assert_ptr_not_equal(efa_rdm_mr1->entry, efa_rdm_mr2->entry);
+
+	assert_int_equal(fi_close(&mr1->fid), 0);
+	assert_int_equal(fi_close(&mr2->fid), 0);
+	free(buf1);
+	free(buf2);
+#endif
+}
+
+/**
+ * @brief Test MR cache LRU behavior
+ *
+ * Tests that MRs with reference count of zero are moved to LRU list
+ * and can be reused when the same region is registered again.
+ */
+void test_efa_rdm_mr_cache_lru_behavior(void **state)
+{
+#ifdef ENABLE_ASAN
+	skip();
+#else
+	struct efa_resource *resource = *state;
+	struct efa_domain *efa_domain;
+	struct fid_mr *mr1 = NULL, *mr2 = NULL;
+	struct efa_rdm_mr *efa_rdm_mr1, *efa_rdm_mr2;
+	struct iovec iov;
+	size_t mr_size = 256;
+	void *buf;
+	int ret;
+
+	/* Create domain with cache enabled */
+	struct fi_info *hints = efa_unit_test_alloc_hints(FI_EP_RDM, EFA_FABRIC_NAME);
+	hints->domain_attr->mr_mode &= ~FI_MR_LOCAL;
+
+	efa_unit_test_resource_construct_with_hints(resource, FI_EP_RDM,
+						    FI_VERSION(2, 0), hints, true, true);
+
+	efa_domain = container_of(resource->domain, struct efa_domain,
+				  util_domain.domain_fid);
+	struct efa_rdm_domain *rdm_domain = (struct efa_rdm_domain *) efa_domain;
+
+	buf = malloc(mr_size);
+	assert_non_null(buf);
+
+	iov.iov_base = buf;
+	iov.iov_len = mr_size;
+
+	/* Initially LRU list should be empty */
+	assert_true(dlist_empty(&rdm_domain->cache->lru_list));
+
+	/* First registration */
+	ret = efa_rdm_mr_cache_regv(resource->domain, &iov, 1,
+				    FI_SEND | FI_RECV, 0, 0, 0, &mr1, NULL);
+	assert_int_equal(ret, 0);
+	assert_non_null(mr1);
+
+	efa_rdm_mr1 = container_of(mr1, struct efa_rdm_mr, efa_mr.mr_fid);
+	assert_non_null(efa_rdm_mr1->entry);
+	/* LRU should be empty while entry is in use */
+	assert_true(dlist_empty(&rdm_domain->cache->lru_list));
+
+	/* Close first MR - should move to LRU list */
+	assert_int_equal(fi_close(&mr1->fid), 0);
+	/* LRU should now contain the entry */
+	assert_false(dlist_empty(&rdm_domain->cache->lru_list));
+
+	/* Register same region again - should reuse from LRU */
+	ret = efa_rdm_mr_cache_regv(resource->domain, &iov, 1,
+				    FI_SEND | FI_RECV, 0, 0, 0, &mr2, NULL);
+	assert_int_equal(ret, 0);
+	assert_non_null(mr2);
+
+	efa_rdm_mr2 = container_of(mr2, struct efa_rdm_mr, efa_mr.mr_fid);
+	assert_non_null(efa_rdm_mr2->entry);
+
+	/* Should reuse the same cache entry from LRU */
+	assert_ptr_equal(efa_rdm_mr1->entry, efa_rdm_mr2->entry);
+	/* LRU should be empty again since entry is back in use */
+	assert_true(dlist_empty(&rdm_domain->cache->lru_list));
+
+	assert_int_equal(fi_close(&mr2->fid), 0);
+	/* LRU should contain the entry again */
+	assert_false(dlist_empty(&rdm_domain->cache->lru_list));
+
+	free(buf);
+#endif
+}
+
+/**
+ * @brief Test MR cache flush behavior
+ *
+ * Tests that cache flush operations properly clean up entries
+ * and that subsequent registrations create new entries.
+ */
+void test_efa_rdm_mr_cache_flush_behavior(void **state)
+{
+#ifdef ENABLE_ASAN
+	skip();
+#else
+	struct efa_resource *resource = *state;
+	struct efa_domain *efa_domain;
+	struct fid_mr *mr1 = NULL, *mr2 = NULL;
+	struct efa_rdm_mr *efa_rdm_mr1, *efa_rdm_mr2;
+	struct iovec iov;
+	size_t mr_size = 256;
+	void *buf;
+	int ret;
+
+	/* Create domain with cache enabled */
+	struct fi_info *hints = efa_unit_test_alloc_hints(FI_EP_RDM, EFA_FABRIC_NAME);
+	hints->domain_attr->mr_mode &= ~FI_MR_LOCAL;
+
+	efa_unit_test_resource_construct_with_hints(resource, FI_EP_RDM,
+						    FI_VERSION(2, 0), hints, true, true);
+
+	efa_domain = container_of(resource->domain, struct efa_domain,
+				  util_domain.domain_fid);
+	struct efa_rdm_domain *rdm_domain = (struct efa_rdm_domain *) efa_domain;
+
+	buf = malloc(mr_size);
+	assert_non_null(buf);
+
+	iov.iov_base = buf;
+	iov.iov_len = mr_size;
+
+	/* Initially LRU list should be empty */
+	assert_true(dlist_empty(&rdm_domain->cache->lru_list));
+
+	/* First registration */
+	ret = efa_rdm_mr_cache_regv(resource->domain, &iov, 1,
+				    FI_SEND | FI_RECV, 0, 0, 0, &mr1, NULL);
+	assert_int_equal(ret, 0);
+	assert_non_null(mr1);
+
+	efa_rdm_mr1 = container_of(mr1, struct efa_rdm_mr, efa_mr.mr_fid);
+	assert_non_null(efa_rdm_mr1->entry);
+	/* LRU should be empty while entry is in use */
+	assert_true(dlist_empty(&rdm_domain->cache->lru_list));
+
+	/* Close MR - moves to LRU */
+	assert_int_equal(fi_close(&mr1->fid), 0);
+	/* LRU should now contain the entry */
+	assert_false(dlist_empty(&rdm_domain->cache->lru_list));
+
+	/* Force cache flush - should clean up LRU entries */
+	ofi_mr_cache_flush(rdm_domain->cache, true /* flush_lru */);
+	/* LRU should be empty after flush */
+	assert_true(dlist_empty(&rdm_domain->cache->lru_list));
+
+	/* Register same region again - should create new entry after flush */
+	ret = efa_rdm_mr_cache_regv(resource->domain, &iov, 1,
+				    FI_SEND | FI_RECV, 0, 0, 0, &mr2, NULL);
+	assert_int_equal(ret, 0);
+	assert_non_null(mr2);
+
+	efa_rdm_mr2 = container_of(mr2, struct efa_rdm_mr, efa_mr.mr_fid);
+	assert_non_null(efa_rdm_mr2->entry);
+	/* Should have a valid new cache entry */
+	assert_int_equal(efa_rdm_mr2->entry->use_cnt, 1);
+
+	assert_int_equal(fi_close(&mr2->fid), 0);
+	free(buf);
+#endif
+}
+
+/**
+ * @brief Test MR cache reference counting
+ *
+ * Tests that multiple references to the same cached region properly
+ * increment/decrement reference counts and manage LRU list placement.
+ */
+void test_efa_rdm_mr_cache_reference_counting(void **state)
+{
+#ifdef ENABLE_ASAN
+	skip();
+#else
+	struct efa_resource *resource = *state;
+	struct efa_domain *efa_domain;
+	struct fid_mr *mr1 = NULL, *mr2 = NULL, *mr3 = NULL;
+	struct efa_rdm_mr *efa_rdm_mr1, *efa_rdm_mr2, *efa_rdm_mr3;
+	struct iovec iov;
+	size_t mr_size = 256;
+	void *buf;
+	int ret;
+
+	/* Create domain with cache enabled */
+	struct fi_info *hints = efa_unit_test_alloc_hints(FI_EP_RDM, EFA_FABRIC_NAME);
+	hints->domain_attr->mr_mode &= ~FI_MR_LOCAL;
+
+	efa_unit_test_resource_construct_with_hints(resource, FI_EP_RDM,
+						    FI_VERSION(2, 0), hints, true, true);
+
+	efa_domain = container_of(resource->domain, struct efa_domain,
+				  util_domain.domain_fid);
+	struct efa_rdm_domain *rdm_domain = (struct efa_rdm_domain *) efa_domain;
+
+	buf = malloc(mr_size);
+	assert_non_null(buf);
+
+	iov.iov_base = buf;
+	iov.iov_len = mr_size;
+
+	/* Initially LRU list should be empty */
+	assert_true(dlist_empty(&rdm_domain->cache->lru_list));
+
+	/* First registration - creates cache entry with use_cnt = 1 */
+	ret = efa_rdm_mr_cache_regv(resource->domain, &iov, 1,
+				    FI_SEND | FI_RECV, 0, 0, 0, &mr1, NULL);
+	assert_int_equal(ret, 0);
+	assert_non_null(mr1);
+
+	efa_rdm_mr1 = container_of(mr1, struct efa_rdm_mr, efa_mr.mr_fid);
+	assert_non_null(efa_rdm_mr1->entry);
+	assert_int_equal(efa_rdm_mr1->entry->use_cnt, 1);
+	/* LRU should still be empty since use_cnt > 0 */
+	assert_true(dlist_empty(&rdm_domain->cache->lru_list));
+
+	/* Second registration - should increment reference count to 2 */
+	ret = efa_rdm_mr_cache_regv(resource->domain, &iov, 1,
+				    FI_SEND | FI_RECV, 0, 0, 0, &mr2, NULL);
+	assert_int_equal(ret, 0);
+	assert_non_null(mr2);
+
+	efa_rdm_mr2 = container_of(mr2, struct efa_rdm_mr, efa_mr.mr_fid);
+	assert_ptr_equal(efa_rdm_mr1->entry, efa_rdm_mr2->entry);
+	assert_int_equal(efa_rdm_mr1->entry->use_cnt, 2);
+	/* LRU should still be empty since use_cnt > 0 */
+	assert_true(dlist_empty(&rdm_domain->cache->lru_list));
+
+	/* Third registration - should increment reference count to 3 */
+	ret = efa_rdm_mr_cache_regv(resource->domain, &iov, 1,
+				    FI_SEND | FI_RECV, 0, 0, 0, &mr3, NULL);
+	assert_int_equal(ret, 0);
+	assert_non_null(mr3);
+
+	efa_rdm_mr3 = container_of(mr3, struct efa_rdm_mr, efa_mr.mr_fid);
+	assert_ptr_equal(efa_rdm_mr1->entry, efa_rdm_mr3->entry);
+	assert_int_equal(efa_rdm_mr1->entry->use_cnt, 3);
+	/* LRU should still be empty since use_cnt > 0 */
+	assert_true(dlist_empty(&rdm_domain->cache->lru_list));
+
+	/* Close first MR - should decrement reference count to 2, not move to LRU */
+	assert_int_equal(fi_close(&mr1->fid), 0);
+	assert_int_equal(efa_rdm_mr2->entry->use_cnt, 2);
+	/* LRU should still be empty since use_cnt > 0 */
+	assert_true(dlist_empty(&rdm_domain->cache->lru_list));
+
+	/* Close second MR - should decrement reference count to 1, not move to LRU */
+	assert_int_equal(fi_close(&mr2->fid), 0);
+	assert_int_equal(efa_rdm_mr3->entry->use_cnt, 1);
+	/* LRU should still be empty since use_cnt > 0 */
+	assert_true(dlist_empty(&rdm_domain->cache->lru_list));
+
+	/* Close third MR - should decrement to zero and move to LRU */
+	assert_int_equal(fi_close(&mr3->fid), 0);
+	/* Now LRU should contain the entry since use_cnt reached 0 */
+	assert_false(dlist_empty(&rdm_domain->cache->lru_list));
+
+	free(buf);
+#endif
+}
+
+#if HAVE_CUDA
+/**
+ * @brief Test RDM MR registration for CUDA memory in non-p2p path
+ *
+ * This test verifies that when p2p is not supported, the non-p2p path
+ * properly initializes the MR structure, including the mem_desc field
+ * and iface field. It uses fi_mr_desc to verify the descriptor is correct.
+ */
+void test_efa_rdm_mr_reg_cuda_memory_non_p2p(void **state)
+{
+	struct efa_resource *resource = *state;
+	struct efa_domain *efa_domain;
+	size_t mr_size = 64;
+	void *buf;
+	struct fid_mr *mr = NULL;
+	struct fi_mr_attr mr_reg_attr = { 0 };
+	struct iovec iovec;
+	struct efa_rdm_mr *efa_rdm_mr;
+	void *desc;
+	int err, baseline_ct, baseline_sz;
+
+	if (!g_efa_hmem_info[FI_HMEM_CUDA].initialized) {
+		skip();
+		return;
+	}
+
+	resource->hints = efa_unit_test_alloc_hints_hmem(
+		FI_EP_RDM, EFA_FABRIC_NAME);
+	efa_unit_test_resource_construct_with_hints(resource, FI_EP_RDM,
+						    FI_VERSION(2, 0),
+						    resource->hints,
+						    true, true);
+
+	efa_domain = container_of(resource->domain, struct efa_domain,
+				  util_domain.domain_fid);
+
+	/* Mock p2p as not supported to force non-p2p path */
+	g_efa_hmem_info[FI_HMEM_CUDA].p2p_supported_by_device = false;
+
+	/* fi_endpoint calls ofi_bufpool_grow, which registers mr */
+	baseline_ct = ofi_atomic_get64(&efa_domain->ibv_mr_reg_ct);
+	baseline_sz = ofi_atomic_get64(&efa_domain->ibv_mr_reg_sz);
+
+	err = ofi_cudaMalloc(&buf, mr_size);
+	assert_int_equal(err, 0);
+	assert_non_null(buf);
+
+	mr_reg_attr.access = FI_SEND | FI_RECV;
+	mr_reg_attr.iface = FI_HMEM_CUDA;
+	iovec.iov_base = buf;
+	iovec.iov_len = mr_size;
+	mr_reg_attr.mr_iov = &iovec;
+	mr_reg_attr.iov_count = 1;
+
+	err = fi_mr_regattr(resource->domain, &mr_reg_attr, 0, &mr);
+	assert_int_equal(err, 0);
+	assert_non_null(mr);
+
+	/* Verify this is an RDM MR */
+	efa_rdm_mr = container_of(mr, struct efa_rdm_mr, efa_mr.mr_fid);
+	assert_non_null(efa_rdm_mr);
+
+	/* Test fi_mr_desc returns the correct descriptor */
+	desc = fi_mr_desc(mr);
+	assert_non_null(desc);
+	assert_ptr_equal(desc, &efa_rdm_mr->efa_mr);
+
+	/* Verify iface is properly set (second bug fix) */
+	assert_int_equal(efa_rdm_mr->efa_mr.iface, FI_HMEM_CUDA);
+
+	/* Verify key is set (non-p2p path should generate proprietary key) */
+	assert_true(fi_mr_key(mr) != FI_KEY_NOTAVAIL);
+	assert_true(fi_mr_key(mr) > UINT32_MAX); /* Non-p2p keys should be > UINT32_MAX */
+
+	/* Since we're in non-p2p path, no ibv_mr should be registered */
+	assert_int_equal(ofi_atomic_get64(&efa_domain->ibv_mr_reg_ct), baseline_ct);
+	assert_int_equal(ofi_atomic_get64(&efa_domain->ibv_mr_reg_sz), baseline_sz);
+
+	/* Verify RDM-specific fields are properly initialized */
+	assert_true(efa_rdm_mr->inserted_to_mr_map);
+	assert_true(efa_rdm_mr->needs_sync); /* CUDA memory should need sync */
+
+	/* Cleanup */
+	assert_int_equal(fi_close(&mr->fid), 0);
+	err = ofi_cudaFree(buf);
+	assert_int_equal(err, 0);
+}
+#else
+void test_efa_rdm_mr_reg_cuda_memory_non_p2p(void **state)
+{
+	skip();
+}
+#endif
+
+/**
+ * @brief Verify that fi_mr_regattr rejects an out-of-range iface value
+ *
+ * @param[in]	state		struct efa_resource that is managed by the framework
+ */
+void test_efa_mr_reg_out_of_range_iface(void **state)
+{
+	struct efa_resource *resource = *state;
+	struct fi_mr_attr mr_reg_attr = {0};
+	struct iovec iov;
+	struct fid_mr *mr = NULL;
+	char buf[64];
+	int err;
+
+	efa_unit_test_resource_construct(resource, FI_EP_RDM, EFA_FABRIC_NAME);
+
+	iov.iov_base = buf;
+	iov.iov_len = sizeof(buf);
+	mr_reg_attr.mr_iov = &iov;
+	mr_reg_attr.iov_count = 1;
+	mr_reg_attr.access = FI_SEND | FI_RECV;
+
+	/* Test with value >= OFI_HMEM_MAX */
+	mr_reg_attr.iface = OFI_HMEM_MAX + 100;
+	err = fi_mr_regattr(resource->domain, &mr_reg_attr, 0, &mr);
+	assert_int_equal(err, -FI_EINVAL);
+
+	/* Test with negative value */
+	mr_reg_attr.iface = (enum fi_hmem_iface)(-1);
+	err = fi_mr_regattr(resource->domain, &mr_reg_attr, 0, &mr);
+	assert_int_equal(err, -FI_EINVAL);
+	assert_null(mr);
+}
+
+/**
+ * Verify that efa_direct_ope is released when fi_recv fails after
+ * allocating the ope, so the error path does not leak it.
+ */
+void test_efa_direct_ope_released_on_recv_error(void **state)
+{
+	struct efa_resource *resource = *state;
+	struct efa_base_ep *base_ep;
+	struct efa_context ctx = {0};
+	size_t buf_size = 64;
+	void *buf;
+	struct iovec iov;
+	struct fi_msg msg = {0};
+	int ret;
+
+	efa_env.track_mr = 1;
+
+	resource->hints = efa_unit_test_alloc_hints(FI_EP_RDM,
+						    EFA_DIRECT_FABRIC_NAME);
+	efa_unit_test_resource_construct_with_hints(resource, FI_EP_RDM,
+						    FI_VERSION(2, 0),
+						    resource->hints,
+						    true, true);
+
+	base_ep = container_of(resource->ep, struct efa_base_ep,
+			       util_ep.ep_fid);
+
+	buf = malloc(buf_size);
+	assert_non_null(buf);
+
+	/* Post a recv with NULL desc to trigger -FI_EINVAL after ope alloc */
+	iov.iov_base = buf;
+	iov.iov_len = buf_size;
+	msg.msg_iov = &iov;
+	msg.iov_count = 1;
+	msg.desc = NULL;
+	msg.context = &ctx;
+
+	ret = fi_recvmsg(resource->ep, &msg, FI_COMPLETION);
+	assert_int_equal(ret, -FI_EINVAL);
+
+	/* The ope list must be empty - ope released on error path */
+	assert_true(dlist_empty(&base_ep->ope_list));
+
+	free(buf);
+}
+
+/**
+ * Verify that efa_direct_ope is released when fi_sendmsg fails after
+ * allocating the ope, so the error path does not leak it.
+ */
+void test_efa_direct_ope_released_on_send_error(void **state)
+{
+	struct efa_resource *resource = *state;
+	struct efa_base_ep *base_ep;
+	struct efa_context ctx = {0};
+	struct efa_ep_addr raw_addr;
+	size_t raw_addr_len = sizeof(raw_addr);
+	fi_addr_t peer_addr;
+	size_t buf_size = 64;
+	void *buf;
+	struct iovec iov;
+	struct fi_msg msg = {0};
+	int ret;
+
+	efa_env.track_mr = 1;
+
+	resource->hints = efa_unit_test_alloc_hints(FI_EP_RDM,
+						    EFA_DIRECT_FABRIC_NAME);
+	efa_unit_test_resource_construct_with_hints(resource, FI_EP_RDM,
+						    FI_VERSION(2, 0),
+						    resource->hints,
+						    true, true);
+
+	base_ep = container_of(resource->ep, struct efa_base_ep,
+			       util_ep.ep_fid);
+
+	/* Insert a fake peer so efa_av_addr_to_conn succeeds */
+	assert_int_equal(fi_getname(&resource->ep->fid, &raw_addr,
+				    &raw_addr_len), 0);
+	raw_addr.qpn = 0;
+	raw_addr.qkey = 0x1234;
+	assert_int_equal(fi_av_insert(resource->av, &raw_addr, 1,
+				      &peer_addr, 0, NULL), 1);
+
+	buf = malloc(buf_size);
+	assert_non_null(buf);
+
+	/* Post a send with NULL desc to trigger -FI_EINVAL after ope alloc */
+	iov.iov_base = buf;
+	iov.iov_len = buf_size;
+	msg.msg_iov = &iov;
+	msg.iov_count = 1;
+	msg.desc = NULL;
+	msg.context = &ctx;
+	msg.addr = peer_addr;
+
+	ret = fi_sendmsg(resource->ep, &msg, FI_COMPLETION);
+	assert_int_equal(ret, -FI_EINVAL);
+
+	/* The ope list must be empty - ope released on error path */
+	assert_true(dlist_empty(&base_ep->ope_list));
+
+	free(buf);
+}
+
+/**
+ * Verify that efa_direct_ope is released when fi_readmsg fails after
+ * allocating the ope, so the error path does not leak it.
+ */
+void test_efa_direct_ope_released_on_read_error(void **state)
+{
+	struct efa_resource *resource = *state;
+	struct efa_base_ep *base_ep;
+	struct efa_context ctx = {0};
+	struct efa_ep_addr raw_addr;
+	size_t raw_addr_len = sizeof(raw_addr);
+	fi_addr_t peer_addr;
+	size_t buf_size = 64;
+	void *buf;
+	struct iovec iov;
+	struct fi_rma_iov rma_iov = {0};
+	struct fi_msg_rma msg = {0};
+	int ret;
+
+	/* Skip test on platforms that don't support RDMA. */
+	if (!efa_device_support_rdma_read() || !efa_device_support_rdma_write()) {
+		skip();
+		return;
+	}
+
+	efa_env.track_mr = 1;
+
+	resource->hints = efa_unit_test_alloc_hints(FI_EP_RDM,
+						    EFA_DIRECT_FABRIC_NAME);
+	resource->hints->caps |= FI_RMA;
+	efa_unit_test_resource_construct_with_hints(resource, FI_EP_RDM,
+						    FI_VERSION(2, 0),
+						    resource->hints,
+						    true, true);
+
+	base_ep = container_of(resource->ep, struct efa_base_ep,
+			       util_ep.ep_fid);
+
+	assert_int_equal(fi_getname(&resource->ep->fid, &raw_addr,
+				    &raw_addr_len), 0);
+	raw_addr.qpn = 0;
+	raw_addr.qkey = 0x1234;
+	assert_int_equal(fi_av_insert(resource->av, &raw_addr, 1,
+				      &peer_addr, 0, NULL), 1);
+
+	buf = malloc(buf_size);
+	assert_non_null(buf);
+
+	iov.iov_base = buf;
+	iov.iov_len = buf_size;
+	rma_iov.addr = 0x1000;
+	rma_iov.len = buf_size;
+	rma_iov.key = 0;
+	msg.msg_iov = &iov;
+	msg.iov_count = 1;
+	msg.desc = NULL;
+	msg.rma_iov = &rma_iov;
+	msg.rma_iov_count = 1;
+	msg.context = &ctx;
+	msg.addr = peer_addr;
+
+	ret = fi_readmsg(resource->ep, &msg, FI_COMPLETION);
+	assert_int_equal(ret, -FI_EINVAL);
+
+	assert_true(dlist_empty(&base_ep->ope_list));
+
+	free(buf);
+}
+
+/**
+ * Verify that efa_direct_ope is released when fi_writemsg fails after
+ * allocating the ope, so the error path does not leak it.
+ */
+void test_efa_direct_ope_released_on_write_error(void **state)
+{
+	struct efa_resource *resource = *state;
+	struct efa_base_ep *base_ep;
+	struct efa_context ctx = {0};
+	struct efa_ep_addr raw_addr;
+	size_t raw_addr_len = sizeof(raw_addr);
+	fi_addr_t peer_addr;
+	size_t buf_size = 64;
+	void *buf;
+	struct iovec iov;
+	struct fi_rma_iov rma_iov = {0};
+	struct fi_msg_rma msg = {0};
+	int ret;
+
+	/* Skip test on platforms that don't support RDMA. */
+	if (!efa_device_support_rdma_read() || !efa_device_support_rdma_write()) {
+		skip();
+		return;
+	}
+
+	efa_env.track_mr = 1;
+
+	resource->hints = efa_unit_test_alloc_hints(FI_EP_RDM,
+						    EFA_DIRECT_FABRIC_NAME);
+	resource->hints->caps |= FI_RMA;
+	efa_unit_test_resource_construct_with_hints(resource, FI_EP_RDM,
+						    FI_VERSION(2, 0),
+						    resource->hints,
+						    true, true);
+
+	base_ep = container_of(resource->ep, struct efa_base_ep,
+			       util_ep.ep_fid);
+
+	assert_int_equal(fi_getname(&resource->ep->fid, &raw_addr,
+				    &raw_addr_len), 0);
+	raw_addr.qpn = 0;
+	raw_addr.qkey = 0x1234;
+	assert_int_equal(fi_av_insert(resource->av, &raw_addr, 1,
+				      &peer_addr, 0, NULL), 1);
+
+	buf = malloc(buf_size);
+	assert_non_null(buf);
+
+	iov.iov_base = buf;
+	iov.iov_len = buf_size;
+	rma_iov.addr = 0x1000;
+	rma_iov.len = buf_size;
+	rma_iov.key = 0;
+	msg.msg_iov = &iov;
+	msg.iov_count = 1;
+	msg.desc = NULL;
+	msg.rma_iov = &rma_iov;
+	msg.rma_iov_count = 1;
+	msg.context = &ctx;
+	msg.addr = peer_addr;
+
+	ret = fi_writemsg(resource->ep, &msg, FI_COMPLETION);
+	assert_int_equal(ret, -FI_EINVAL);
+
+	assert_true(dlist_empty(&base_ep->ope_list));
+
+	free(buf);
+}
+
+/*
+ * Verify that closing an efa_rdm_mr advances its generation counter and
+ * that the counter survives bufpool slot reuse. After a close/reopen
+ * cycle we expect the same slot back (ofi_bufpool is LIFO) with a strictly
+ * greater gen.
+ */
+void test_efa_rdm_mr_gen_bumps_on_close(void **state)
+{
+	struct efa_resource *resource = *state;
+	size_t mr_size = 64;
+	void *buf1;
+	void *buf2;
+	struct fid_mr *mr_fid1 = NULL;
+	struct fid_mr *mr_fid2 = NULL;
+	struct efa_rdm_mr *rdm_mr1;
+	struct efa_rdm_mr *rdm_mr2;
+	uint32_t first_gen;
+
+	efa_unit_test_resource_construct(resource, FI_EP_RDM, EFA_FABRIC_NAME);
+
+	buf1 = malloc(mr_size);
+	assert_non_null(buf1);
+	buf2 = malloc(mr_size);
+	assert_non_null(buf2);
+
+	assert_int_equal(fi_mr_reg(resource->domain, buf1, mr_size,
+				   FI_SEND | FI_RECV, 0, 0, 0, &mr_fid1, NULL),
+			 0);
+	rdm_mr1 = container_of(mr_fid1, struct efa_rdm_mr, efa_mr.mr_fid);
+	first_gen = rdm_mr1->gen;
+	assert_int_equal(rdm_mr1->efa_mr.lkey,
+			 rdm_mr1->efa_mr.ibv_mr->lkey);
+	assert_int_equal(fi_close(&mr_fid1->fid), 0);
+
+	assert_int_equal(fi_mr_reg(resource->domain, buf2, mr_size,
+				   FI_SEND | FI_RECV, 0, 0, 0, &mr_fid2, NULL),
+			 0);
+	rdm_mr2 = container_of(mr_fid2, struct efa_rdm_mr, efa_mr.mr_fid);
+	assert_true(rdm_mr2 == rdm_mr1);
+	assert_true(rdm_mr2->gen == first_gen + 1);
+
+	assert_int_equal(fi_close(&mr_fid2->fid), 0);
+	free(buf1);
+	free(buf2);
+}
+
+/**
+ * Verify that efa_rdm_mr_gen_check_ope skips the gen check for an RXE
+ * queued with EFA_RDM_OPE_QUEUED_CTRL (CTS packet). On the receiver side
+ * of a long CTS operation, if posting the CTS fails with -FI_EAGAIN the
+ * RXE is added to ope_queued_list. When efa_rdm_ep_progress_peers_and_queues
+ * processes this entry it calls efa_rdm_mr_gen_check_ope, which must
+ * return true without reading ope->desc_gen (since the check is TXE-only).
+ */
+void test_efa_rdm_mr_gen_check_ope_skips_rxe_queued_ctrl_cts(void **state)
+{
+	struct efa_resource *resource = *state;
+	struct efa_rdm_ope *rxe;
+	struct efa_rdm_ep *efa_rdm_ep;
+
+	efa_unit_test_resource_construct(resource, FI_EP_RDM, EFA_FABRIC_NAME);
+
+	efa_rdm_ep = container_of(resource->ep, struct efa_rdm_ep,
+				  base_ep.util_ep.ep_fid);
+
+	/* Allocate RXE simulating receiver side of a long CTS operation */
+	rxe = efa_unit_test_alloc_rxe(resource, ofi_op_msg);
+	assert_non_null(rxe);
+
+	/*
+	 * Set desc_gen to the invalid sentinel. If efa_rdm_mr_gen_check_ope
+	 * ever tries to read this for an RXE, it would hit the assert that
+	 * desc_gen is valid. The fact that the test passes proves the check
+	 * is skipped for RXEs.
+	 */
+	rxe->iov_count = 1;
+	rxe->desc[0] = NULL;
+	rxe->desc_gen[0] = EFA_RDM_MR_INVALID_GEN_VALUE;
+
+	/* Simulate EAGAIN on CTS post: set QUEUED_CTRL and add to queue */
+	rxe->internal_flags |= EFA_RDM_OPE_QUEUED_CTRL;
+	rxe->queued_ctrl_type = EFA_RDM_CTS_PKT;
+	dlist_insert_tail(&rxe->queued_entry, &efa_rdm_ep->ope_queued_list);
+
+	assert_int_equal(
+		efa_unit_test_get_dlist_length(&efa_rdm_ep->ope_queued_list), 1);
+
+	/*
+	 * Directly invoke efa_rdm_mr_gen_check_ope on the RXE.
+	 * This is the same check that efa_rdm_ope_process_queued_ope calls
+	 * before attempting to repost. For an RXE it must return true
+	 * without attempting to read ope->desc_gen (which holds the
+	 * invalid sentinel and would trigger an assert if accessed).
+	 */
+	assert_true(efa_rdm_mr_gen_check_ope(rxe));
+
+	/* Clean up: remove from queued list and release */
+	dlist_remove(&rxe->queued_entry);
+	rxe->internal_flags &= ~EFA_RDM_OPE_QUEUED_CTRL;
+	efa_rdm_rxe_release(rxe);
+}
+
+ /*
+  * Verify that the gen capture function does not overwrite a previously
+  * captured gen value on the repost path. Without the sentinel guard,
+  * a second capture after MR close would snapshot the new gen, causing
+  * the gen check to incorrectly pass.
+  */
+void test_efa_rdm_mr_gen_capture_not_overwritten_on_repost(void **state)
+{
+	struct efa_resource *resource = *state;
+	struct efa_rdm_ope *txe;
+	struct fid_mr *mr = NULL;
+	struct efa_mr *efa_mr;
+	size_t mr_size = 64;
+	void *buf;
+	uint32_t captured_gen;
+
+	efa_unit_test_resource_construct(resource, FI_EP_RDM, EFA_FABRIC_NAME);
+
+	buf = malloc(mr_size);
+	assert_non_null(buf);
+
+	assert_int_equal(fi_mr_reg(resource->domain, buf, mr_size,
+			 FI_SEND | FI_RECV, 0, 0, 0, &mr, NULL), 0);
+	efa_mr = container_of(mr, struct efa_mr, mr_fid);
+
+	/* Simulate dispatch: alloc txe, set desc, capture gen */
+	txe = efa_unit_test_alloc_txe(resource, ofi_op_msg);
+	assert_non_null(txe);
+	txe->iov_count = 1;
+	txe->desc[0] = efa_mr;
+	efa_rdm_mr_gen_capture_in_ope_desc(txe);
+	captured_gen = txe->desc_gen[0];
+	assert_true(efa_rdm_mr_gen_value_is_valid(captured_gen));
+
+	/* Close MR (bumps gen) */
+	assert_int_equal(fi_close(&mr->fid), 0);
+
+	/* Simulate repost: capture called again — must NOT overwrite */
+	efa_rdm_mr_gen_capture_in_ope_desc(txe);
+	assert_int_equal(txe->desc_gen[0], captured_gen);
+
+	/* Gen check detects mismatch */
+	assert_false(efa_rdm_mr_gen_check_ope(txe));
+
+	/* Clean up */
+	efa_rdm_txe_release(txe);
+	free(buf);
+}
+
+/**
+ * Verify that efa_rdm_mr_gen_check_ope detects a closed MR.
+ * Simulates the queued-before-handshake scenario: an ope captures
+ * desc state at dispatch, the app closes the MR while the ope is
+ * queued, and the gen check catches the mismatch before repost.
+ */
+void test_efa_rdm_mr_gen_check_ope_detects_closed_mr(void **state)
+{
+	struct efa_resource *resource = *state;
+	struct efa_rdm_ope *txe;
+	struct fid_mr *mr = NULL;
+	struct efa_mr *efa_mr;
+	size_t mr_size = 64;
+	void *buf;
+
+	efa_unit_test_resource_construct(resource, FI_EP_RDM, EFA_FABRIC_NAME);
+
+	buf = malloc(mr_size);
+	assert_non_null(buf);
+
+	assert_int_equal(fi_mr_reg(resource->domain, buf, mr_size,
+				   FI_SEND | FI_RECV, 0, 0, 0, &mr, NULL), 0);
+	efa_mr = container_of(mr, struct efa_mr, mr_fid);
+
+	/* Simulate dispatch: alloc txe, set desc, capture gen+lkey */
+	txe = efa_unit_test_alloc_txe(resource, ofi_op_msg);
+	assert_non_null(txe);
+	txe->iov_count = 1;
+	txe->desc[0] = efa_mr;
+	efa_rdm_mr_gen_capture_in_ope_desc(txe);
+
+	/* Before close: gen check should pass (MR valid) */
+	assert_true(efa_rdm_mr_gen_check_ope(txe));
+
+	/* Close MR (bumps gen) */
+	assert_int_equal(fi_close(&mr->fid), 0);
+
+	/* After close: gen check should detect mismatch (MR invalid) */
+	assert_false(efa_rdm_mr_gen_check_ope(txe));
+
+	/* Clean up */
+	efa_rdm_txe_release(txe);
+	free(buf);
+}
+
+/*
+ * Verify that efa-direct fi_send with a closed MR does not crash.
+ * efa_post_send always reads efa_mr->lkey from desc (no conditional
+ * copy path), so this deterministically exercises the cached lkey.
+ */
+void test_efa_direct_fi_send_with_closed_mr_no_crash(void **state)
+{
+	struct efa_resource *resource = *state;
+	struct efa_ep_addr raw_addr;
+	size_t raw_addr_len = sizeof(raw_addr);
+	fi_addr_t peer_addr;
+	struct fid_mr *mr = NULL;
+	size_t buf_size = 512;
+	void *buf;
+	struct iovec iov;
+	struct fi_msg msg = {0};
+	void *desc;
+	int ret;
+
+	resource->hints = efa_unit_test_alloc_hints(FI_EP_RDM, EFA_DIRECT_FABRIC_NAME);
+	efa_unit_test_resource_construct_with_hints(resource, FI_EP_RDM, FI_VERSION(2, 0),
+						    resource->hints, true, true);
+
+	buf = calloc(buf_size, 1);
+	assert_non_null(buf);
+	ret = fi_mr_reg(resource->domain, buf, buf_size, FI_SEND | FI_RECV, 0, 0, 0, &mr, NULL);
+	assert_int_equal(ret, 0);
+
+	ret = fi_getname(&resource->ep->fid, &raw_addr, &raw_addr_len);
+	assert_int_equal(ret, 0);
+	raw_addr.qpn = 0;
+	raw_addr.qkey = 0x1234;
+	ret = fi_av_insert(resource->av, &raw_addr, 1, &peer_addr, 0, NULL);
+	assert_int_equal(ret, 1);
+
+	/* Save the descriptor before closing the MR (ibv_mr becomes NULL) */
+	desc = fi_mr_desc(mr);
+	assert_int_equal(fi_close(&mr->fid), 0);
+
+	/* Mock post_send as success, as we only test that the WR build path doesn't crash */
+	g_efa_unit_test_mocks.efa_qp_post_send = &efa_mock_efa_qp_post_send_return_mock;
+	will_return_int(efa_mock_efa_qp_post_send_return_mock, 0);
+
+	/* fi_send reads efa_mr->lkey (cached) and does not crash by derefrencing the MR */
+	iov.iov_base = buf;
+	iov.iov_len = buf_size;
+	msg.msg_iov = &iov;
+	msg.iov_count = 1;
+	msg.desc = &desc;
+	msg.addr = peer_addr;
+
+	ret = fi_sendmsg(resource->ep, &msg, FI_COMPLETION);
+	/* assert on the mocked value just for sanity */
+	assert_int_equal(ret, 0);
+
+	free(buf);
+}
+
+/*
+ * Verify that an RNR-queued operation is canceled with FI_ECANCELED
+ * when the MR is closed while the pkt is queued for retransmit.
+ * Progress drives process_queued_ope → gen check fails → CQ error.
+ */
+void test_efa_rdm_mr_gen_check_cancels_rnr_queued_ope(void **state)
+{
+	struct efa_resource *resource = *state;
+	struct efa_ep_addr raw_addr;
+	size_t raw_addr_len = sizeof(raw_addr);
+	fi_addr_t peer_addr;
+	struct efa_rdm_ep *efa_rdm_ep;
+	struct efa_rdm_peer *peer;
+	struct efa_rdm_ope *txe;
+	struct efa_rdm_pke *pkt_entry;
+	struct efa_rdm_cq *efa_rdm_cq;
+	struct efa_ibv_cq *ibv_cq;
+	struct fi_cq_data_entry cq_entry;
+	struct fi_cq_err_entry cq_err_entry = {0};
+	struct fid_mr *mr = NULL;
+	size_t buf_size = 4096;
+	void *buf;
+	uint64_t wr_id;
+	void *desc;
+	int ret;
+
+	efa_unit_test_resource_construct_rdm_shm_disabled(resource);
+
+	buf = calloc(buf_size, 1);
+	assert_non_null(buf);
+	ret = fi_mr_reg(resource->domain, buf, 4096, FI_SEND | FI_RECV, 0, 0, 0, &mr, NULL);
+	assert_int_equal(ret, 0);
+
+	ret = fi_getname(&resource->ep->fid, &raw_addr, &raw_addr_len);
+	assert_int_equal(ret, 0);
+	raw_addr.qpn = 0;
+	raw_addr.qkey = 0x1234;
+	ret = fi_av_insert(resource->av, &raw_addr, 1, &peer_addr, 0, NULL);
+	assert_int_equal(ret, 1);
+
+	efa_rdm_ep = container_of(resource->ep, struct efa_rdm_ep, base_ep.util_ep.ep_fid);
+	peer = efa_rdm_ep_get_peer_explicit(efa_rdm_ep, peer_addr);
+	peer->flags |= EFA_RDM_PEER_HANDSHAKE_RECEIVED;
+
+	/* Mock a successful send, the packet is tracked as submitted */
+	g_efa_unit_test_mocks.efa_qp_post_send = &efa_mock_efa_qp_post_send_return_mock;
+	will_return_int_maybe(efa_mock_efa_qp_post_send_return_mock, 0);
+
+	desc = fi_mr_desc(mr);
+	ret = fi_send(resource->ep, buf, buf_size, desc, peer_addr, NULL);
+	assert_int_equal(ret, 0);
+
+	/* Retrieve the txe and pkt */
+	txe = container_of(efa_rdm_ep->base_ep.ope_list.next, struct efa_rdm_ope, ep_entry);
+	efa_rdm_cq = container_of(resource->cq, struct efa_rdm_cq, efa_cq.util_cq.cq_fid.fid);
+	ibv_cq = &efa_rdm_cq->efa_cq.ibv_cq;
+	wr_id = (uint64_t)g_ibv_submitted_wr_id_vec[0];
+	pkt_entry = efa_rdm_cq_get_pke_from_wr_id(ibv_cq, wr_id);
+	pkt_entry->ope = txe;
+
+	/* Simulate RNR: complete the tx operation, then queue the packet for retransmit */
+	efa_rdm_ep_record_tx_op_completed(efa_rdm_ep, pkt_entry);
+	efa_rdm_ep_queue_rnr_pkt(efa_rdm_ep, pkt_entry);
+
+	/* Close MR while the packet is queued */
+	assert_int_equal(fi_close(&mr->fid), 0);
+
+	/* Mock empty CQ poll so progress only processes queued opes */
+	g_efa_unit_test_mocks.efa_ibv_cq_start_poll = &efa_mock_efa_ibv_cq_start_poll_return_mock;
+	will_return_int_maybe(efa_mock_efa_ibv_cq_start_poll_return_mock, ENOENT);
+
+	/* Drive progress, the gen check should fail, and the ope will be canceled */
+	ret = fi_cq_read(resource->cq, &cq_entry, 1);
+	assert_int_equal(ret, -FI_EAVAIL);
+
+	/* Read the error */
+	ret = fi_cq_readerr(resource->cq, &cq_err_entry, 0);
+	assert_int_equal(ret, 1);
+	assert_int_equal(cq_err_entry.err, FI_ECANCELED);
+
+	free(buf);
+}
+
+/*
+ * Verify that a long-CTS ope is canceled with FI_ECANCELED when the
+ * MR is closed while the ope is on ope_longcts_send_list waiting to
+ * drip CTSDATA packets.
+ */
+void test_efa_rdm_mr_gen_check_cancels_longcts_ope(void **state)
+{
+	struct efa_resource *resource = *state;
+	struct efa_ep_addr raw_addr;
+	size_t raw_addr_len = sizeof(raw_addr);
+	fi_addr_t peer_addr;
+	struct efa_rdm_ep *efa_rdm_ep;
+	struct efa_rdm_peer *peer;
+	struct efa_rdm_ope *txe;
+	struct efa_rdm_pke *pkt_entry;
+	struct efa_rdm_cq *efa_rdm_cq;
+	struct efa_ibv_cq *ibv_cq;
+	struct efa_rdm_pke *cts_pke;
+	struct efa_rdm_cts_hdr *cts_hdr;
+	struct fi_cq_data_entry cq_entry;
+	struct fi_cq_err_entry cq_err_entry = {0};
+	struct fid_mr *mr = NULL;
+	size_t buf_size = 4096;
+	void *buf;
+	uint64_t wr_id;
+	void *desc;
+	int ret;
+
+	efa_unit_test_resource_construct_rdm_shm_disabled(resource);
+
+	buf = calloc(buf_size, 1);
+	assert_non_null(buf);
+	ret = fi_mr_reg(resource->domain, buf, 4096, FI_SEND | FI_RECV, 0, 0, 0, &mr, NULL);
+	assert_int_equal(ret, 0);
+
+	ret = fi_getname(&resource->ep->fid, &raw_addr, &raw_addr_len);
+	assert_int_equal(ret, 0);
+	raw_addr.qpn = 0;
+	raw_addr.qkey = 0x1234;
+	ret = fi_av_insert(resource->av, &raw_addr, 1, &peer_addr, 0, NULL);
+	assert_int_equal(ret, 1);
+
+	efa_rdm_ep = container_of(resource->ep, struct efa_rdm_ep, base_ep.util_ep.ep_fid);
+	peer = efa_rdm_ep_get_peer_explicit(efa_rdm_ep, peer_addr);
+	peer->flags |= EFA_RDM_PEER_HANDSHAKE_RECEIVED;
+
+	/* Mock a successful send, the initial RTM goes out */
+	g_efa_unit_test_mocks.efa_qp_post_send = &efa_mock_efa_qp_post_send_return_mock;
+	will_return_int_maybe(efa_mock_efa_qp_post_send_return_mock, 0);
+
+	desc = fi_mr_desc(mr);
+	ret = fi_send(resource->ep, buf, buf_size, desc, peer_addr, NULL);
+	assert_int_equal(ret, 0);
+
+	/* Complete the initial RTM pkt so it doesn't leak on teardown */
+	efa_rdm_cq = container_of(resource->cq, struct efa_rdm_cq, efa_cq.util_cq.cq_fid.fid);
+	ibv_cq = &efa_rdm_cq->efa_cq.ibv_cq;
+	wr_id = (uint64_t)g_ibv_submitted_wr_id_vec[0];
+	pkt_entry = efa_rdm_cq_get_pke_from_wr_id(ibv_cq, wr_id);
+	efa_rdm_ep_record_tx_op_completed(efa_rdm_ep, pkt_entry);
+	efa_rdm_pke_release_tx(pkt_entry);
+
+	/* Retrieve the txe */
+	txe = container_of(efa_rdm_ep->base_ep.ope_list.next, struct efa_rdm_ope, ep_entry);
+
+	/*
+	 * Simulate receiving a CTS: craft a CTS pke and call the handler.
+	 * This sets ope->window and inserts the ope onto ope_longcts_send_list.
+	 */
+	cts_pke = efa_rdm_pke_alloc(efa_rdm_ep, efa_rdm_ep->efa_rx_pkt_pool, EFA_RDM_PKE_FROM_EFA_RX_POOL);
+	assert_non_null(cts_pke);
+	cts_pke->ep = efa_rdm_ep;
+	cts_hdr = (struct efa_rdm_cts_hdr *)cts_pke->wiredata;
+	cts_hdr->type = EFA_RDM_CTS_PKT;
+	cts_hdr->send_id = txe->tx_id;
+	cts_hdr->recv_id = 0;
+	cts_hdr->recv_length = 4096;
+
+	efa_rdm_pke_handle_cts_recv(cts_pke);
+
+	/* Force RX counters to satisfy invariant after CTS handler released the pke */
+	efa_rdm_ep->efa_rx_pkts_to_post = 0;
+	efa_rdm_ep->efa_rx_pkts_posted = efa_base_ep_get_rx_pool_size(&efa_rdm_ep->base_ep);
+	efa_rdm_ep->efa_rx_pkts_held = 0;
+
+	/* Verify ope is on the longcts list */
+	assert_int_equal(txe->state, EFA_RDM_OPE_SEND);
+	assert_true(txe->window > 0);
+	assert_false(dlist_empty(&efa_rdm_ep->ope_longcts_send_list));
+	assert_true(efa_rdm_ep->needs_progress);
+	assert_false(dlist_empty(&efa_rdm_cq->progress_ep_list));
+
+	/* Close the MR while the ope is waiting to drip CTSDATA */
+	assert_int_equal(fi_close(&mr->fid), 0);
+
+	/* Mock empty CQ and mark peer handshake as received so progress will enter the loop */
+	g_efa_unit_test_mocks.efa_ibv_cq_start_poll = &efa_mock_efa_ibv_cq_start_poll_return_mock;
+	will_return_int_maybe(efa_mock_efa_ibv_cq_start_poll_return_mock, ENOENT);
+
+	/* Drive progress, the gen check should fail, and the ope will be canceled */
+	ret = fi_cq_read(resource->cq, &cq_entry, 1);
+	assert_int_equal(ret, -FI_EAVAIL);
+
+	/* Read the error */
+	ret = fi_cq_readerr(resource->cq, &cq_err_entry, 0);
+	assert_int_equal(ret, 1);
+	assert_int_equal(cq_err_entry.err, FI_ECANCELED);
+
+	free(buf);
+}
+
+/**
+ * @brief Test efa_mr_ofi_to_ibv_access sets IBV_ACCESS_RELAXED_ORDERING only
+ * when FI_EFA_MR_RELAXED_ORDERING is passed in flags.
+ */
+void test_efa_mr_ofi_to_ibv_access_relaxed_ordering(void **state)
+{
+	int ibv_access;
+
+	/* Without the flag, relaxed ordering is not set. */
+	ibv_access = efa_mr_ofi_to_ibv_access(FI_SEND | FI_RECV, true, true, 0);
+	assert_false(ibv_access & IBV_ACCESS_RELAXED_ORDERING);
+
+	/* With the flag, relaxed ordering is added on top of the access bits
+	 * the ofi access would otherwise produce. */
+	ibv_access = efa_mr_ofi_to_ibv_access(FI_SEND | FI_RECV, true, true,
+					      FI_EFA_MR_RELAXED_ORDERING);
+	assert_true(ibv_access & IBV_ACCESS_RELAXED_ORDERING);
+	assert_int_equal(ibv_access & ~IBV_ACCESS_RELAXED_ORDERING,
+			 IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ);
+}
+
+/**
+ * @brief FI_EFA_MR_RELAXED_ORDERING is accepted by efa_mr_regattr_validate on
+ * both the efa-direct and efa (RDM) fabrics.
+ */
+static void test_efa_mr_relaxed_ordering_validate_impl(struct efa_resource *resource,
+						       char *fabric_name,
+						       int expected_ret)
+{
+	char buf[64];
+	struct iovec iov = { .iov_base = buf, .iov_len = sizeof buf };
+	struct fi_mr_attr attr = {0};
+
+	efa_unit_test_resource_construct(resource, FI_EP_RDM, fabric_name);
+
+	attr.mr_iov = &iov;
+	attr.iov_count = 1;
+	attr.access = FI_SEND | FI_RECV;
+	attr.iface = FI_HMEM_SYSTEM;
+
+	assert_int_equal(efa_mr_regattr_validate(&resource->domain->fid, &attr,
+						 FI_EFA_MR_RELAXED_ORDERING),
+			 expected_ret);
+}
+
+void test_efa_mr_relaxed_ordering_validate_direct(void **state)
+{
+	test_efa_mr_relaxed_ordering_validate_impl(*state, EFA_DIRECT_FABRIC_NAME, 0);
+}
+
+void test_efa_mr_relaxed_ordering_validate_rdm(void **state)
+{
+	test_efa_mr_relaxed_ordering_validate_impl(*state, EFA_FABRIC_NAME, 0);
+}

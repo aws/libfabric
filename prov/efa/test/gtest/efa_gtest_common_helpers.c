@@ -1,0 +1,242 @@
+/* SPDX-License-Identifier: BSD-2-Clause OR GPL-2.0-only */
+/* SPDX-FileCopyrightText: Copyright Amazon.com, Inc. or its affiliates. All rights reserved. */
+
+#include "efa.h"
+#include "efa_av.h"
+#include "efa_cq.h"
+#include "efa_mr.h"
+#include "efa_device.h"
+#include "rdm/efa_rdm_ep.h"
+#include "rdm/efa_rdm_mr.h"
+#include "ofi_mr.h"
+#include "efa_gtest_common_helpers.h"
+
+void efa_test_fabricate_addr(struct fid_ep *ep, struct efa_ep_addr *addr)
+{
+	size_t addr_len = sizeof(*addr);
+	static uint8_t gid_suffix = 1;
+
+	memset(addr, 0, addr_len);
+	// Get ep's actual address
+	fi_getname(&ep->fid, addr, &addr_len);
+	// Flip the first bit
+	addr->raw[0] ^= 0xFF;
+	addr->raw[15] = gid_suffix++;
+	addr->qpn = 1;
+	addr->qkey = 0x5678;
+}
+
+int efa_test_av_insert_fake_gid(struct fid_ep *ep, struct fid_av *av,
+				fi_addr_t *addr)
+{
+	struct efa_ep_addr raw_addr;
+
+	efa_test_fabricate_addr(ep, &raw_addr);
+	return fi_av_insert(av, &raw_addr, 1, addr, 0, NULL);
+}
+
+int efa_test_av_insert_self(struct fid_ep *ep, struct fid_av *av,
+			    fi_addr_t *addr)
+{
+	struct efa_ep_addr raw_addr = {0};
+	size_t raw_addr_len = sizeof(raw_addr);
+	int ret;
+
+	ret = fi_getname(&ep->fid, &raw_addr, &raw_addr_len);
+	if (ret)
+		return ret;
+	raw_addr.qpn = 0;
+	raw_addr.qkey = 0x1234;
+
+	return fi_av_insert(av, &raw_addr, 1, addr, 0, NULL);
+}
+
+fi_addr_t efa_test_av_insert_new_ah(struct fid_ep *ep, struct fid_av *av)
+{
+	struct efa_av *efa_av;
+	struct efa_ep_addr raw_addr;
+	fi_addr_t fi_addr = FI_ADDR_NOTAVAIL;
+	int err;
+
+	efa_av = container_of(av, struct efa_av, util_av.av_fid);
+
+	efa_test_fabricate_addr(ep, &raw_addr);
+
+	ofi_genlock_lock(&efa_av->domain->util_domain.lock);
+	ofi_genlock_lock(&((struct efa_rdm_av *) efa_av)->util_av_implicit.lock);
+	err = efa_rdm_av_insert_one_implicit(efa_av, &raw_addr, &fi_addr, 0, NULL);
+	ofi_genlock_unlock(&((struct efa_rdm_av *) efa_av)->util_av_implicit.lock);
+	ofi_genlock_unlock(&efa_av->domain->util_domain.lock);
+
+	if (err)
+		return FI_ADDR_NOTAVAIL;
+
+	return fi_addr;
+}
+
+struct efa_context *efa_test_alloc_context(uint64_t completion_flags,
+					   fi_addr_t addr)
+{
+	struct efa_context *ctx = calloc(1, sizeof(*ctx));
+
+	if (!ctx)
+		return NULL;
+	ctx->completion_flags = completion_flags;
+	ctx->addr = addr;
+	return ctx;
+}
+
+struct efa_ibv_cq *efa_test_get_ibv_cq(struct fid_cq *cq_fid)
+{
+	struct efa_cq *efa_cq;
+
+	efa_cq = container_of(cq_fid, struct efa_cq, util_cq.cq_fid);
+	return &efa_cq->ibv_cq;
+}
+
+char *efa_test_get_cq_err_buf(struct fid_cq *cq_fid)
+{
+	struct efa_cq *efa_cq;
+
+	efa_cq = container_of(cq_fid, struct efa_cq, util_cq.cq_fid);
+	return efa_cq->err_buf;
+}
+
+const size_t efa_test_cq_err_buf_len = EFA_ERROR_MSG_BUFFER_LENGTH;
+
+uint32_t efa_test_get_qp_num(struct fid_ep *ep)
+{
+	struct efa_base_ep *base_ep;
+
+	base_ep = container_of(ep, struct efa_base_ep, util_ep.ep_fid);
+	return base_ep->qp->qp_num;
+}
+
+void efa_test_set_ibv_cq_ex(struct efa_ibv_cq *ibv_cq, int status,
+			    uint64_t wr_id)
+{
+	ibv_cq->ibv_cq_ex->status = status;
+	ibv_cq->ibv_cq_ex->wr_id = wr_id;
+}
+
+int efa_test_set_track_mr(int value)
+{
+	int prev = efa_env.track_mr;
+
+	efa_env.track_mr = value;
+	return prev;
+}
+
+int efa_test_device_supports_rma(void)
+{
+	if (g_efa_selected_device_cnt <= 0)
+		return 0;
+
+	return efa_device_support_rdma_read() &&
+	       efa_device_support_rdma_write();
+}
+
+size_t efa_test_ope_list_count(struct fid_ep *ep)
+{
+	struct efa_base_ep *base_ep =
+		container_of(ep, struct efa_base_ep, util_ep.ep_fid);
+	struct dlist_entry *item;
+	size_t count = 0;
+
+	dlist_foreach(&base_ep->ope_list, item)
+		count++;
+
+	return count;
+}
+
+void efa_test_get_zero_byte_bounce_buf(struct fid_ep *ep, uint64_t *addr,
+				       uint32_t *lkey)
+{
+	struct efa_base_ep *base_ep =
+		container_of(ep, struct efa_base_ep, util_ep.ep_fid);
+	struct efa_domain *domain = base_ep->domain;
+
+	*addr = (uint64_t) domain->zero_byte_bounce_buf;
+	*lkey = domain->zero_byte_bounce_buf_mr->lkey;
+}
+
+ssize_t efa_test_cq_read_staged_data_entry(struct fid_cq *cq_fid,
+					   struct fi_cq_data_entry *entry)
+{
+	struct efa_cq *efa_cq =
+		container_of(cq_fid, struct efa_cq, util_cq.cq_fid);
+
+	return ofi_cq_read_entries(&efa_cq->util_cq, entry, 1, NULL);
+}
+
+struct ibv_ah *efa_test_implicit_addr_to_ibv_ah(struct fid_av *av,
+						fi_addr_t fi_addr)
+{
+	struct efa_av *efa_av =
+		container_of(av, struct efa_av, util_av.av_fid);
+	struct efa_rdm_av_entry *av_entry = efa_rdm_av_addr_to_entry_implicit(efa_av, fi_addr);
+
+	return av_entry ? av_entry->efa_av_entry.ah->ibv_ah : NULL;
+}
+
+static struct efa_rdm_domain *efa_test_rdm_domain(struct fid_domain *domain)
+{
+	struct efa_domain *efa_domain = container_of(
+		domain, struct efa_domain, util_domain.domain_fid);
+
+	return container_of(efa_domain, struct efa_rdm_domain, efa_domain);
+}
+
+struct fid_domain *efa_test_get_shm_domain(struct fid_domain *domain)
+{
+	return efa_test_rdm_domain(domain)->shm_domain;
+}
+
+void efa_test_set_shm_domain(struct fid_domain *domain,
+			     struct fid_domain *shm_domain)
+{
+	efa_test_rdm_domain(domain)->shm_domain = shm_domain;
+}
+
+int efa_test_get_util_domain_ref(struct fid_domain *domain)
+{
+	struct efa_domain *efa_domain = container_of(
+		domain, struct efa_domain, util_domain.domain_fid);
+
+	return ofi_atomic_get32(&efa_domain->util_domain.ref);
+}
+
+int efa_test_util_domain_trylock(struct fid_domain *domain)
+{
+	struct efa_domain *efa_domain = container_of(
+		domain, struct efa_domain, util_domain.domain_fid);
+	int ret;
+
+	ret = ofi_mutex_trylock(&efa_domain->util_domain.lock.base.mutex);
+	if (!ret)
+		ofi_mutex_unlock(&efa_domain->util_domain.lock.base.mutex);
+	return ret;
+}
+
+void efa_test_util_domain_unlock(struct fid_domain *domain)
+{
+	struct efa_domain *efa_domain = container_of(
+		domain, struct efa_domain, util_domain.domain_fid);
+
+	ofi_genlock_unlock(&efa_domain->util_domain.lock);
+}
+
+/*
+ * The gdrcopy device-registration handle bit (OFI_HMEM_DATA_DEV_REG_HANDLE) is
+ * defined in ofi_mr.h, which cannot be included from C++ (it transitively pulls
+ * in _Complex types). Expose it to the C++ tests via this C helper.
+ */
+uint64_t efa_test_ofi_hmem_data_dev_reg_handle(void)
+{
+	return OFI_HMEM_DATA_DEV_REG_HANDLE;
+}
+
+uint64_t efa_test_rdm_mr_shm_flags(uint64_t mr_flags, enum fi_hmem_iface iface)
+{
+	return efa_rdm_mr_shm_flags(mr_flags, iface);
+}

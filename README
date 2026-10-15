@@ -1,0 +1,132 @@
+Version @VERSION@
+Released on @DATE@
+
+Introduction
+============
+Libfabric is a communication library that exports interfaces for
+fabric services to applications.  Libfabric is the core component
+of the Open Fabrics Interfaces (OFI) framework.
+
+Libfabric has the following objectives:
+
+* High-performance: provide optimized software paths to hardware
+  - Independent of hardware implementations
+* Scalable: targets support for millions of processes
+  - Designed to reduce cache and memory footprint
+  - Scalable address resolution and storage
+  - Tight data structures
+* Application-centric
+  - Interfaces co-designed with application developers and hardware
+    vendors
+* Extensible
+  - Easily adaptable to support future application needs
+
+OFI is being developed by the OFI Working Group (OFIWG) a subgroup
+of the OpenFabrics Alliance (OFA).  Participation in OFIWG
+(pronounced o-fee-wig) is open to anyone, regardless of their
+membership in OFA.
+
+The goal of OFI and libfabric is to define interfaces that enable
+a tight semantic map between applications and underlying fabric
+services.  Specifically, libfabric software interfaces have been
+co-designed with fabric hardware providers and application developers,
+with an initial focus on the needs of HPC users.  OFI supports multiple
+interface semantics, is fabric and hardware implementation agnostic,
+and leverages and expands the existing RDMA open source community.
+
+For more information regarding the OFI project, please visit the OFIWG
+GitHub site:
+
+http://ofiwg.github.io/libfabric/
+or
+http://libfabric.org
+
+
+Support
+=======
+OFI targets support for the Linux operating system. A reasonable effort
+is made to support all major, modern Linux distributions; however,
+validation is limited to the most recent 2-3 releases of RedHat
+Enterprise Linux (RHEL)and SUSE Linux Enterprise Server (SLES).
+OFI aligns its supported distributions with the most current
+OpenFabrics Enterprise Distribution (OFED) software releases. With
+the exception of the sockets provider, which is provided for development
+purposes, distro support for a specific provider is vendor specific.
+
+Libfabric will also run on OS X, but OS X support is provided as a convenience
+for developers.
+
+Bugs, issues, or requests for feature enhancements may be made directly to
+the github issues list:
+
+https://github.com/ofiwg/libfabric/issues
+
+Additionally, users may post questions, comments, bugs, etc. to the Libfabric
+users mailing list.  (Don't be bashful.  We don't bite.)
+
+libfabric-users@lists.openfabrics.org
+
+Patches may be submitted using github (preferred) or posted to the OFIWG
+mail list.
+
+
+Building
+========
+To install from a libfabric source package run the following commands:
+
+./configure && make && make install
+
+If building directly from the libfabric git tree, run './autogen.sh'
+before the configure step.
+
+Configure Options
+-----------------
+The configure script has many built-in options (see './configure --help').
+Some useful options are:
+
+--prefix=<directory>
+    By default 'make install' will place the files in the '/usr' tree.
+    The '--prefix' option specifies that libfabric files should be
+    installed into the tree specified by named <directory>.
+
+--with-cuda[=DIR]
+    Enable CUDA build and fail if not found. Optional=<Path to where the
+    CUDA libraries and headers are installed.> This enables CUDA memory
+    support for heterogeneous memory (HMEM) operations.
+
+--with-rocr[=DIR]
+    Enable ROCR/HSA build and fail if not found. Optional=<Path to where
+    the ROCR/HSA libraries and headers are installed.> This enables ROCr
+    memory support for heterogeneous memory (HMEM) operations.
+
+--with-neuron[=DIR]
+    Enable Neuron build and fail if not found. Optional=<Path to where the
+    Neuron libraries and headers are installed.> This enables Neuron memory
+    support for heterogeneous memory (HMEM) operations.
+
+--with-synapseai[=DIR]
+    Enable SynapseAI build and fail if not found. Optional=<Path to where
+    the SynapseAI libraries and headers are installed.> This enables
+    SynapseAI memory support for heterogeneous memory (HMEM) operations.
+
+--with-ze[=DIR]
+    Enable ZE build and fail if not found. Optional=<Path to where the ZE
+    libraries and headers are installed.> This enables Intel GPU memory
+    support for heterogeneous memory (HMEM) operations.
+
+--enable-cuda-dlopen
+    Enable dlopen of CUDA libraries [default=no]. This allows building
+    binaries that can run on systems with or without CUDA runtime.
+
+--enable-rocr-dlopen
+    Enable dlopen of ROCR libraries [default=no]. This allows building
+    binaries that can run on systems with or without ROCR runtime.
+
+--enable-ze-dlopen
+    Enable dlopen of ZE libraries [default=no]. This allows building
+    binaries that can run on systems with or without ZE runtime.
+
+Windows
+=======
+Please find Windows specific instructions in docs/windows.txt file
+

@@ -1,0 +1,43 @@
+/* SPDX-License-Identifier: BSD-2-Clause OR GPL-2.0-only */
+/* SPDX-FileCopyrightText: Copyright Amazon.com, Inc. or its affiliates. All rights reserved. */
+
+#if HAVE_CONFIG_H
+#include <config.h>
+#endif /* HAVE_CONFIG_H */
+
+#ifndef _EFA_CNTR_H_
+#define _EFA_CNTR_H_
+
+struct efa_cntr {
+	struct util_cntr util_cntr;
+	struct dlist_entry ibv_cq_poll_list;
+	/* Hardware completion counter */
+	struct ibv_comp_cntr *ibv_comp_cntr;
+	/* Whether completion counter memory is on device (DMABUF) without host mapping */
+	bool comp_use_device_mem;
+	/* Whether error counter memory is on device (DMABUF) without host mapping */
+	bool err_use_device_mem;
+	/* Wait object type from fi_cntr_attr */
+	enum fi_wait_obj wait_obj;
+};
+
+int efa_cntr_open(struct fid_domain *domain, struct fi_cntr_attr *attr,
+		  struct fid_cntr **cntr_fid, void *context);
+
+int efa_cntr_construct(struct efa_cntr *cntr, struct fid_domain *domain,
+		       struct fi_cntr_attr *attr,
+		       ofi_cntr_progress_func progress, void *context);
+
+void efa_cntr_destruct(struct efa_cntr *cntr);
+
+void efa_cntr_progress_ibv_cq_poll_list(struct efa_cntr *efa_cntr);
+
+int efa_cntr_wait(struct fid_cntr *cntr_fid, uint64_t threshold, int timeout);
+
+void efa_cntr_report_tx_completion(struct util_ep *ep, uint64_t flags);
+
+void efa_cntr_report_rx_completion(struct util_ep *ep, uint64_t flags);
+
+void efa_cntr_report_error(struct util_ep *ep, uint64_t flags);
+
+#endif

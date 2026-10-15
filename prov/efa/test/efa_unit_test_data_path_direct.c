@@ -1,0 +1,360 @@
+/* SPDX-License-Identifier: BSD-2-Clause OR GPL-2.0-only */
+/* SPDX-FileCopyrightText: Copyright Amazon.com, Inc. or its affiliates. All
+ * rights reserved. */
+
+#include "efa_unit_tests.h"
+#include "ofi_util.h"
+#include "efa_io_defs.h"
+#include "efa_data_path_direct_entry.h"
+
+static void test_efa_data_path_direct_multiple_sge_fail_impl(void **state, uint32_t fi_opcode)
+{
+#if HAVE_EFA_DATA_PATH_DIRECT
+	struct efa_resource *resource = *state;
+	struct efa_unit_test_buff local_buff1, local_buff2;
+	struct ibv_sge sge_list[2];
+	struct efa_qp *qp;
+	struct efa_cq *efa_cq;
+	bool data_path_direct_enabled_orig;
+	struct fid_ep *ep;
+
+	efa_unit_test_resource_construct(resource, FI_EP_RDM, EFA_DIRECT_FABRIC_NAME);
+	efa_cq = container_of(resource->cq, struct efa_cq, util_cq.cq_fid);
+	data_path_direct_enabled_orig = efa_cq->ibv_cq.data_path_direct_enabled;
+	efa_cq->ibv_cq.data_path_direct_enabled = true;
+
+	/* Open a test ep with data path direct enabled */
+	assert_int_equal(fi_endpoint(resource->domain, resource->info, &ep, NULL), 0);
+	assert_int_equal(fi_ep_bind(ep, &resource->cq->fid, FI_SEND | FI_RECV), 0);
+	assert_int_equal(fi_enable(ep), 0);
+
+	qp = container_of(ep, struct efa_base_ep, util_ep.ep_fid)->qp;
+	efa_unit_test_buff_construct(&local_buff1, resource, 2048);
+	efa_unit_test_buff_construct(&local_buff2, resource, 2048);
+
+	/* Setup SGE list with 2 elements (exceeds EFA_IO_TX_DESC_NUM_RDMA_BUFS=1) */
+	sge_list[0].addr = (uintptr_t)local_buff1.buff;
+	sge_list[0].length = local_buff1.size;
+	sge_list[0].lkey = ((struct efa_mr *)fi_mr_desc(local_buff1.mr))->ibv_mr->lkey;
+	sge_list[1].addr = (uintptr_t)local_buff2.buff;
+	sge_list[1].length = local_buff2.size;
+	sge_list[1].lkey = ((struct efa_mr *)fi_mr_desc(local_buff2.mr))->ibv_mr->lkey;
+
+	/* Test multiple SGE failure with consolidated post functions */
+	int ret;
+	if (fi_opcode == FI_READ) {
+		ret = efa_data_path_direct_post_read(qp, sge_list, 2, 123456, 0x87654321, 0, 0, NULL, 0, 0);
+	} else {
+		ret = efa_data_path_direct_post_write(qp, sge_list, 2, NULL, false, 123456, 0x87654321, 0, 0, 0, NULL, 0, 0);
+	}
+	assert_int_equal(ret, EINVAL);
+
+	assert_int_equal(fi_close(&ep->fid), 0);
+	efa_cq->ibv_cq.data_path_direct_enabled = data_path_direct_enabled_orig;
+	efa_unit_test_buff_destruct(&local_buff1);
+	efa_unit_test_buff_destruct(&local_buff2);
+#else
+	skip();
+#endif
+}
+
+void test_efa_data_path_direct_rdma_read_multiple_sge_fail(void **state)
+{
+	test_efa_data_path_direct_multiple_sge_fail_impl(state, FI_READ);
+}
+
+void test_efa_data_path_direct_rdma_write_multiple_sge_fail(void **state)
+{
+	test_efa_data_path_direct_multiple_sge_fail_impl(state, FI_WRITE);
+}
+
+
+/**
+ * @brief Verify that QP generation counter increments on each QP creation
+ * for the same QPN slot, and that gen_mask/shifted_gen are set correctly
+ * on the data path direct work queues.
+ */
+void test_efa_data_path_direct_qp_gen_initialization(void **state)
+{
+#if HAVE_EFA_DATA_PATH_DIRECT
+	struct efa_resource *resource = *state;
+	struct efa_base_ep *base_ep;
+	struct efa_qp *qp;
+	struct efa_data_path_direct_wq *sq_wq, *rq_wq;
+
+	efa_unit_test_resource_construct(resource, FI_EP_RDM, EFA_DIRECT_FABRIC_NAME);
+
+	base_ep = container_of(resource->ep, struct efa_base_ep, util_ep.ep_fid);
+	qp = base_ep->qp;
+
+	sq_wq = &qp->data_path_direct_qp.sq.wq;
+	rq_wq = &qp->data_path_direct_qp.rq.wq;
+
+	/* gen_mask should be the inverse of desc_mask, within 16 bits */
+	assert_int_equal(sq_wq->gen_mask, (uint16_t)~sq_wq->desc_mask);
+	assert_int_equal(rq_wq->gen_mask, (uint16_t)~rq_wq->desc_mask);
+
+	/* shifted_gen should be gen shifted into the upper bits */
+	assert_int_equal(sq_wq->shifted_gen,
+			 (uint16_t)(qp->data_path_direct_qp.gen << __bf_shf(sq_wq->desc_mask + 1)));
+	assert_int_equal(rq_wq->shifted_gen,
+			 (uint16_t)(qp->data_path_direct_qp.gen << __bf_shf(rq_wq->desc_mask + 1)));
+
+	/* gen_mask and desc_mask together should cover all 16 bits (no gap) */
+	assert_int_equal((uint16_t)(sq_wq->gen_mask | sq_wq->desc_mask), 0xFFFF);
+	assert_int_equal((uint16_t)(rq_wq->gen_mask | rq_wq->desc_mask), 0xFFFF);
+
+	/* gen_mask and desc_mask should not overlap */
+	assert_int_equal((uint16_t)(sq_wq->gen_mask & sq_wq->desc_mask), 0);
+	assert_int_equal((uint16_t)(rq_wq->gen_mask & rq_wq->desc_mask), 0);
+#else
+	skip();
+#endif
+}
+
+/**
+ * @brief Verify that efa_wq_get_dev_req_id returns a request ID with
+ * generation bits OR'd in, and that efa_wq_cqe_finalize correctly
+ * strips them before returning the index to the pool.
+ */
+void test_efa_data_path_direct_dev_req_id_roundtrip(void **state)
+{
+#if HAVE_EFA_DATA_PATH_DIRECT
+	struct efa_resource *resource = *state;
+	struct efa_base_ep *base_ep;
+	struct efa_qp *qp;
+	struct efa_data_path_direct_wq *sq_wq;
+	struct efa_io_cdesc_common fake_cqe = {0};
+	uint32_t dev_req_id;
+	uint32_t wrid_idx;
+	uint64_t test_wr_id = 0xDEADBEEF;
+	uint16_t pool_next_before;
+
+	efa_unit_test_resource_construct(resource, FI_EP_RDM, EFA_DIRECT_FABRIC_NAME);
+
+	base_ep = container_of(resource->ep, struct efa_base_ep, util_ep.ep_fid);
+	qp = base_ep->qp;
+	sq_wq = &qp->data_path_direct_qp.sq.wq;
+
+	pool_next_before = sq_wq->wrid_idx_pool_next;
+
+	/* Get a dev_req_id — should have gen bits set */
+	dev_req_id = efa_wq_get_dev_req_id(sq_wq, test_wr_id);
+
+	/* The generation bits should be present */
+	assert_int_equal(dev_req_id & sq_wq->gen_mask, sq_wq->shifted_gen);
+
+	/* The wrid index portion should be valid (within desc_mask range) */
+	wrid_idx = dev_req_id & ~sq_wq->gen_mask;
+	assert_true(wrid_idx <= sq_wq->desc_mask);
+
+	/* The wr_id should be stored in the wrid array */
+	assert_int_equal(sq_wq->wrid[wrid_idx], test_wr_id);
+
+	/* Pool next should have advanced by 1 */
+	assert_int_equal(sq_wq->wrid_idx_pool_next, pool_next_before + 1);
+
+	/* Finalize using a fake CQE with the dev_req_id */
+	fake_cqe.req_id = dev_req_id;
+	efa_wq_cqe_finalize(sq_wq, &fake_cqe);
+
+	/* Pool next should be back to original */
+	assert_int_equal(sq_wq->wrid_idx_pool_next, pool_next_before);
+#else
+	skip();
+#endif
+}
+
+/**
+ * @brief Verify that efa_data_path_direct_is_valid_wrid_qp_gen detects
+ * a stale completion whose generation bits don't match the current QP.
+ */
+void test_efa_data_path_direct_stale_completion_detected(void **state)
+{
+#if HAVE_EFA_DATA_PATH_DIRECT
+	struct efa_resource *resource = *state;
+	struct efa_base_ep *base_ep;
+	struct efa_qp *qp;
+	struct efa_data_path_direct_wq *sq_wq;
+	struct efa_io_cdesc_common fake_cqe = {0};
+
+	efa_unit_test_resource_construct(resource, FI_EP_RDM, EFA_DIRECT_FABRIC_NAME);
+
+	base_ep = container_of(resource->ep, struct efa_base_ep, util_ep.ep_fid);
+	qp = base_ep->qp;
+	sq_wq = &qp->data_path_direct_qp.sq.wq;
+
+	/* Build a fake CQE for a send completion with correct generation */
+	fake_cqe.req_id = sq_wq->shifted_gen;
+	EFA_SET(&fake_cqe.flags, EFA_IO_CDESC_COMMON_Q_TYPE, EFA_IO_SEND_QUEUE);
+
+	/* Current gen should be valid */
+	assert_true(efa_data_path_direct_is_valid_wrid_qp_gen(&fake_cqe, qp));
+
+	/* Now simulate a stale completion with a different generation.
+	 * req_id is uint16_t, so use a gen value offset by 1 within the
+	 * 16-bit range to ensure it differs from the current shifted_gen.
+	 */
+	fake_cqe.req_id = (uint16_t)(sq_wq->shifted_gen + (1 << __bf_shf(sq_wq->desc_mask + 1)));
+
+	/* Stale gen should be detected as invalid */
+	assert_false(efa_data_path_direct_is_valid_wrid_qp_gen(&fake_cqe, qp));
+
+	/* Unsolicited recv completions should always be valid (no wrid to check) */
+	EFA_SET(&fake_cqe.flags, EFA_IO_CDESC_COMMON_Q_TYPE, EFA_IO_RECV_QUEUE);
+	EFA_SET(&fake_cqe.flags, EFA_IO_CDESC_COMMON_UNSOLICITED, 1);
+	assert_true(efa_data_path_direct_is_valid_wrid_qp_gen(&fake_cqe, qp));
+#else
+	skip();
+#endif
+}
+
+/**
+ * @brief Verify that the QP generation counter increments across
+ * QP destroy/create cycles on the same QPN slot.
+ */
+void test_efa_data_path_direct_qp_gen_increments_across_qps(void **state)
+{
+#if HAVE_EFA_DATA_PATH_DIRECT
+	struct efa_resource *resource = *state;
+	struct efa_base_ep *base_ep;
+	uint8_t first_gen;
+
+	efa_unit_test_resource_construct(resource, FI_EP_RDM, EFA_DIRECT_FABRIC_NAME);
+	base_ep = container_of(resource->ep, struct efa_base_ep, util_ep.ep_fid);
+	first_gen = base_ep->qp->data_path_direct_qp.gen;
+
+	efa_unit_test_resource_destruct(resource);
+	memset(resource, 0, sizeof(*resource));
+
+	efa_unit_test_resource_construct(resource, FI_EP_RDM, EFA_DIRECT_FABRIC_NAME);
+	base_ep = container_of(resource->ep, struct efa_base_ep, util_ep.ep_fid);
+
+	assert_int_equal(base_ep->qp->data_path_direct_qp.gen, (uint8_t) (first_gen + 1));
+#else
+	skip();
+#endif
+}
+
+/**
+ * @brief Test that efa_send_wr_set_processing_hint_high_pps sets the processing
+ * hint bits in ctrl3 of the TX WQE metadata descriptor.
+ */
+void test_efa_data_path_direct_write_high_pps_hint_set(void **state)
+{
+#if HAVE_EFA_DATA_PATH_DIRECT
+	struct efa_io_tx_meta_desc meta_desc = {0};
+
+	assert_true(EFA_GET(&meta_desc.ctrl3, EFA_IO_TX_META_DESC_PROCESSING_HINTS) == 0);
+
+	efa_send_wr_set_processing_hint_high_pps(&meta_desc);
+
+	assert_true(EFA_GET(&meta_desc.ctrl3, EFA_IO_TX_META_DESC_PROCESSING_HINTS) != 0);
+#else
+	skip();
+#endif
+}
+
+/**
+ * @brief Verify that efa_set_sq_comp_wrid and efa_get_sq_comp_wrid
+ * correctly roundtrip a full 64-bit wr_id through the meta descriptor
+ * and TX completion descriptor when in 64-bit request ID mode.
+ */
+void test_efa_data_path_direct_64_bit_req_id_roundtrip(void **state)
+{
+#if HAVE_EFA_DATA_PATH_DIRECT
+	struct efa_data_path_direct_wq wq = {0};
+	struct efa_io_tx_meta_desc meta_desc = {0};
+	struct efa_io_tx_cdesc tx_cqe = {0};
+	uint64_t test_wr_id = 0x123456789ABCDEF0ULL;
+	uint64_t recovered_wr_id;
+
+	wq.req_id_64_bit = true;
+
+	/* Set the 64-bit wr_id into the meta descriptor */
+	efa_set_sq_comp_wrid(&meta_desc, &wq, test_wr_id);
+
+	/* Simulate device echoing the req_id fields back in the CQE */
+	tx_cqe.common.req_id = meta_desc.req_id;
+	tx_cqe.req_id_ex = meta_desc.req_id_ex;
+
+	/* Recover the wr_id from the CQE */
+	recovered_wr_id = efa_get_sq_comp_wrid(&wq, &tx_cqe.common);
+
+	assert_int_equal(recovered_wr_id, test_wr_id);
+#else
+	skip();
+#endif
+}
+
+/**
+ * @brief Verify that efa_wq_cqe_finalize increments wqe_completed but
+ * does not touch the pool index when in 64-bit request ID mode.
+ */
+void test_efa_data_path_direct_64_bit_cqe_finalize_no_pool(void **state)
+{
+#if HAVE_EFA_DATA_PATH_DIRECT
+	struct efa_resource *resource = *state;
+	struct efa_base_ep *base_ep;
+	struct efa_qp *qp;
+	struct efa_data_path_direct_wq *sq_wq;
+	struct efa_io_cdesc_common fake_cqe = {0};
+	uint16_t pool_next_before;
+	uint32_t wqe_completed_before;
+
+	efa_unit_test_resource_construct(resource, FI_EP_RDM, EFA_DIRECT_FABRIC_NAME);
+
+	base_ep = container_of(resource->ep, struct efa_base_ep, util_ep.ep_fid);
+	qp = base_ep->qp;
+	sq_wq = &qp->data_path_direct_qp.sq.wq;
+
+	/* Force 64-bit mode */
+	sq_wq->req_id_64_bit = true;
+
+	pool_next_before = sq_wq->wrid_idx_pool_next;
+	wqe_completed_before = sq_wq->wqe_completed;
+
+	fake_cqe.req_id = 0x1234;
+	efa_wq_cqe_finalize(sq_wq, &fake_cqe);
+
+	/* wqe_completed should have incremented */
+	assert_int_equal(sq_wq->wqe_completed, wqe_completed_before + 1);
+
+	/* Pool next should NOT have changed */
+	assert_int_equal(sq_wq->wrid_idx_pool_next, pool_next_before);
+#else
+	skip();
+#endif
+}
+
+/**
+ * @brief Verify that efa_cqe_is_64_bit_comp returns true for SQ CQEs
+ * when req_id_64_bit is set, and false for RQ CQEs.
+ */
+void test_efa_data_path_direct_64_bit_comp_detection(void **state)
+{
+#if HAVE_EFA_DATA_PATH_DIRECT
+	struct efa_resource *resource = *state;
+	struct efa_base_ep *base_ep;
+	struct efa_qp *qp;
+	struct efa_io_cdesc_common fake_cqe = {0};
+
+	efa_unit_test_resource_construct(resource, FI_EP_RDM, EFA_DIRECT_FABRIC_NAME);
+
+	base_ep = container_of(resource->ep, struct efa_base_ep, util_ep.ep_fid);
+	qp = base_ep->qp;
+
+	/* Force 64-bit mode on SQ */
+	qp->data_path_direct_qp.sq.wq.req_id_64_bit = true;
+
+	/* SQ CQE should be detected as 64-bit */
+	EFA_SET(&fake_cqe.flags, EFA_IO_CDESC_COMMON_Q_TYPE, EFA_IO_SEND_QUEUE);
+	assert_true(efa_cqe_is_64_bit_comp(&fake_cqe, qp));
+
+	/* RQ CQE should not be detected as 64-bit */
+	EFA_SET(&fake_cqe.flags, EFA_IO_CDESC_COMMON_Q_TYPE, EFA_IO_RECV_QUEUE);
+	assert_false(efa_cqe_is_64_bit_comp(&fake_cqe, qp));
+#else
+	skip();
+#endif
+}

@@ -1,0 +1,411 @@
+#
+# Copyright (c) 2018-2022 Amazon.com, Inc. or its affiliates. All rights reserved.
+#
+# This software is available to you under a choice of one of two
+# licenses.  You may choose to be licensed under the terms of the GNU
+# General Public License (GPL) Version 2, available from the file
+# COPYING in the main directory of this source tree, or the
+# BSD license below:
+#
+#     Redistribution and use in source and binary forms, with or
+#     without modification, are permitted provided that the following
+#     conditions are met:
+#
+#      - Redistributions of source code must retain the above
+#        copyright notice, this list of conditions and the following
+#        disclaimer.
+#
+#      - Redistributions in binary form must reproduce the above
+#        copyright notice, this list of conditions and the following
+#        disclaimer in the documentation and/or other materials
+#        provided with the distribution.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
+# BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+# ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+# CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+if HAVE_EFA
+_efa_files = \
+	prov/efa/src/efa_device.c \
+	prov/efa/src/efa_thread_annotations.c \
+	prov/efa/src/efa_hmem.c \
+	prov/efa/src/efa_shm.c \
+	prov/efa/src/efa_av.c \
+	prov/efa/src/efa_av_array.c \
+	prov/efa/src/efa_ah.c \
+	prov/efa/src/rdm/efa_rdm_av.c \
+	prov/efa/src/rdm/efa_rdm_domain.c \
+	prov/efa/src/efa_domain.c \
+	prov/efa/src/efa_domain_util.c \
+	prov/efa/src/efa_fabric.c \
+	prov/efa/src/efa_fabric_util.c \
+	prov/efa/src/rdm/efa_rdm_fabric.c \
+	prov/efa/src/efa_mr.c \
+	prov/efa/src/efa_strerror.c \
+	prov/efa/src/efa_user_info.c \
+	prov/efa/src/efa_prov_info.c \
+	prov/efa/src/efa_fork_support.c \
+	prov/efa/src/efa_tp_def.c \
+	prov/efa/src/efa_base_ep.c \
+	prov/efa/src/efa_direct_ope.c \
+	prov/efa/src/efa_prov.c	\
+	prov/efa/src/efa_env.c	\
+	prov/efa/src/efa_cntr.c	\
+	prov/efa/src/efa_hw_cntr.c \
+	prov/efa/src/efa_msg.c \
+	prov/efa/src/efa_rma.c \
+	prov/efa/src/efa_cq.c \
+	prov/efa/src/efa_ep.c \
+	prov/efa/src/efa_data_path_direct.c \
+	prov/efa/src/rdm/efa_rdm_peer.c	\
+	prov/efa/src/rdm/efa_rdm_cq.c \
+	prov/efa/src/rdm/efa_rdm_cntr.c \
+	prov/efa/src/rdm/efa_rdm_ep_utils.c \
+	prov/efa/src/rdm/efa_rdm_ep_fiops.c \
+	prov/efa/src/rdm/efa_rdm_rma.c	\
+	prov/efa/src/rdm/efa_rdm_msg.c	\
+	prov/efa/src/rdm/efa_rdm_pke.c \
+	prov/efa/src/rdm/efa_rdm_pke_utils.c \
+	prov/efa/src/rdm/efa_rdm_pke_rtm.c \
+	prov/efa/src/rdm/efa_rdm_pke_rtr.c \
+	prov/efa/src/rdm/efa_rdm_pke_rtw.c \
+	prov/efa/src/rdm/efa_rdm_pke_rta.c \
+	prov/efa/src/rdm/efa_rdm_pke_req.c \
+	prov/efa/src/rdm/efa_rdm_pke_nonreq.c \
+	prov/efa/src/rdm/efa_rdm_pke_cmd.c \
+	prov/efa/src/rdm/efa_rdm_pke_print.c \
+	prov/efa/src/rdm/efa_rdm_pkt_type.c \
+	prov/efa/src/rdm/efa_rdm_ope.c \
+	prov/efa/src/rdm/efa_rdm_rxe_map.c \
+	prov/efa/src/rdm/efa_rdm_atomic.c \
+	prov/efa/src/rdm/efa_rdm_tracepoint_def.c \
+	prov/efa/src/rdm/efa_rdm_srx.c \
+	prov/efa/src/rdm/efa_rdm_util.c \
+	prov/efa/src/rdm/efa_rdm_mr.c
+
+if ENABLE_EFA_DATA_PATH_OPS_STUB
+_efa_files += prov/efa/test/efa_unit_test_data_path_ops.c
+endif ENABLE_EFA_DATA_PATH_OPS_STUB
+
+_efa_headers = \
+	prov/efa/src/efa.h \
+	prov/efa/src/efa_av.h \
+	prov/efa/src/efa_av_array.h \
+	prov/efa/src/efa_ah.h \
+	prov/efa/src/rdm/efa_rdm_av.h \
+	prov/efa/src/efa_mr.h \
+	prov/efa/src/efa_shm.h \
+	prov/efa/src/efa_hmem.h \
+	prov/efa/src/efa_device.h \
+	prov/efa/src/efa_thread_annotations.h \
+	prov/efa/src/efa_domain.h \
+	prov/efa/src/efa_domain_util.h \
+	prov/efa/src/efa_fabric_util.h \
+	prov/efa/src/efa_errno.h \
+	prov/efa/src/efa_user_info.h \
+	prov/efa/src/efa_prov_info.h \
+	prov/efa/src/efa_fork_support.h \
+	prov/efa/src/efa_cq.h \
+	prov/efa/src/efa_cntr.h \
+	prov/efa/src/efa_hw_cntr.h \
+	prov/efa/src/efa_base_ep.h \
+	prov/efa/src/efa_direct_ope.h \
+	prov/efa/src/efa_tp_def.h \
+	prov/efa/src/efa_tp.h \
+	prov/efa/src/efa_prov.h \
+	prov/efa/src/efa_env.h \
+	prov/efa/src/fi_ext_efa.h \
+	prov/efa/src/efa_abi.h \
+	prov/efa/src/efa_data_path_ops.h \
+	prov/efa/src/efa_io_defs.h \
+	prov/efa/src/efa_io_regs_defs.h \
+	prov/efa/src/efa_data_path_direct_structs.h \
+	prov/efa/src/efa_data_path_direct_entry.h \
+	prov/efa/src/efa_data_path_direct.h \
+	prov/efa/src/efa_data_path_direct_internal.h \
+	prov/efa/src/efa_mmio.h \
+	prov/efa/src/rdm/efa_rdm_peer.h	\
+	prov/efa/src/rdm/efa_rdm_domain.h \
+	prov/efa/src/rdm/efa_rdm_fabric.h \
+	prov/efa/src/rdm/efa_rdm_cq.h \
+	prov/efa/src/rdm/efa_rdm_cntr.h \
+	prov/efa/src/rdm/efa_rdm_ep.h \
+	prov/efa/src/rdm/efa_rdm_rma.h \
+	prov/efa/src/rdm/efa_rdm_msg.h \
+	prov/efa/src/rdm/efa_rdm_pke.h \
+	prov/efa/src/rdm/efa_rdm_pke_utils.h \
+	prov/efa/src/rdm/efa_rdm_pke_req.h \
+	prov/efa/src/rdm/efa_rdm_pke_rtm.h \
+	prov/efa/src/rdm/efa_rdm_pke_rtr.h \
+	prov/efa/src/rdm/efa_rdm_pke_rtw.h \
+	prov/efa/src/rdm/efa_rdm_pke_rta.h \
+	prov/efa/src/rdm/efa_rdm_pke_nonreq.h \
+	prov/efa/src/rdm/efa_rdm_pke_cmd.h \
+	prov/efa/src/rdm/efa_rdm_pke_print.h \
+	prov/efa/src/rdm/efa_rdm_pkt_type.h \
+	prov/efa/src/rdm/efa_rdm_atomic.h \
+	prov/efa/src/rdm/efa_rdm_ope.h \
+	prov/efa/src/rdm/efa_rdm_rxe_map.h \
+	prov/efa/src/rdm/efa_rdm_protocol.h \
+	prov/efa/src/rdm/efa_rdm_tracepoint_def.h \
+	prov/efa/src/rdm/efa_rdm_hmem_tracepoint_def.h \
+	prov/efa/src/rdm/efa_rdm_tracepoint.h \
+	prov/efa/src/rdm/efa_rdm_srx.h \
+	prov/efa/src/rdm/efa_rdm_util.h \
+	prov/efa/src/rdm/efa_rdm_mr.h
+
+if HAVE_LTTNG
+efa_LDFLAGS += -llttng-ust
+endif HAVE_LTTNG
+
+if ENABLE_EFA_UNIT_TEST
+noinst_PROGRAMS += prov/efa/test/efa_unit_test
+TESTS += prov/efa/test/efa_unit_test
+nodist_prov_efa_test_efa_unit_test_SOURCES = \
+	prov/efa/test/efa_unit_tests.h \
+	prov/efa/test/efa_unit_tests.c \
+	prov/efa/test/efa_unit_test_mocks.c \
+	prov/efa/test/efa_unit_test_common.c \
+	prov/efa/test/efa_unit_test_domain.c \
+	prov/efa/test/efa_unit_test_rdm_domain.c \
+	prov/efa/test/efa_unit_test_fabric.c \
+	prov/efa/test/efa_unit_test_ep.c \
+	prov/efa/test/efa_unit_test_av.c \
+	prov/efa/test/efa_unit_test_rdm_av.c \
+	prov/efa/test/efa_unit_test_cq.c \
+	prov/efa/test/efa_unit_test_cntr.c \
+	prov/efa/test/efa_unit_test_device.c \
+	prov/efa/test/efa_unit_test_info.c \
+	prov/efa/test/efa_unit_test_hmem.c \
+	prov/efa/test/efa_unit_test_srx.c \
+	prov/efa/test/efa_unit_test_rnr.c \
+	prov/efa/test/efa_unit_test_ope.c \
+	prov/efa/test/efa_unit_test_send.c \
+	prov/efa/test/efa_unit_test_fork_support.c \
+	prov/efa/test/efa_unit_test_runt.c \
+	prov/efa/test/efa_unit_test_mr.c \
+	prov/efa/test/efa_unit_test_rdm_peer.c \
+	prov/efa/test/efa_unit_test_pke.c \
+	prov/efa/test/efa_unit_test_msg.c \
+	prov/efa/test/efa_unit_test_rma.c \
+	prov/efa/test/efa_unit_test_rdm_rma.c \
+	prov/efa/test/efa_unit_test_data_path_direct.c
+
+
+efa_CPPFLAGS += -I$(top_srcdir)/include -I$(top_srcdir)/prov/efa/test $(cmocka_CPPFLAGS)
+
+prov_efa_test_efa_unit_test_CPPFLAGS = $(efa_CPPFLAGS)
+prov_efa_test_efa_unit_test_LDADD = $(cmocka_LIBS) $(linkback)
+prov_efa_test_efa_unit_test_LDFLAGS = -static $(cmocka_rpath) $(efa_LDFLAGS) $(cmocka_LDFLAGS) \
+					-Wl,--wrap=ibv_create_ah \
+					-Wl,--wrap=ibv_destroy_ah \
+					-Wl,--wrap=ibv_is_fork_initialized \
+					-Wl,--wrap=efadv_query_device \
+					-Wl,--wrap=efa_rdm_ah_alloc \
+					-Wl,--wrap=efa_rdm_ah_release \
+					-Wl,--wrap=ofi_cudaMalloc \
+					-Wl,--wrap=cuda_set_sync_memops \
+					-Wl,--wrap=ofi_cuDeviceGet \
+					-Wl,--wrap=ofi_cuCtxCreate_v2 \
+					-Wl,--wrap=ofi_cuCtxDestroy \
+					-Wl,--wrap=ofi_cuMemAlloc \
+					-Wl,--wrap=ofi_cuMemFree \
+					-Wl,--wrap=ofi_copy_from_hmem_iov \
+					-Wl,--wrap=ofi_copy_to_hmem_iov \
+					-Wl,--wrap=efa_rdm_pke_copy_payload_to_ope \
+					-Wl,--wrap=efa_rdm_pke_read \
+					-Wl,--wrap=efa_rdm_pke_proc_matched_rtm \
+					-Wl,--wrap=efa_rdm_ope_post_send \
+					-Wl,--wrap=efa_device_support_unsolicited_write_recv \
+					-Wl,--wrap=efa_qp_post_recv \
+					-Wl,--wrap=efa_qp_post_send \
+					-Wl,--wrap=efa_qp_post_read \
+					-Wl,--wrap=efa_qp_post_write \
+					-Wl,--wrap=efa_ibv_cq_start_poll \
+					-Wl,--wrap=efa_ibv_cq_next_poll \
+					-Wl,--wrap=efa_ibv_cq_end_poll \
+					-Wl,--wrap=efa_ibv_cq_wc_read_opcode \
+					-Wl,--wrap=efa_ibv_cq_wc_read_qp_num \
+					-Wl,--wrap=efa_ibv_cq_wc_read_vendor_err \
+					-Wl,--wrap=efa_ibv_cq_wc_read_src_qp \
+					-Wl,--wrap=efa_ibv_cq_wc_read_slid \
+					-Wl,--wrap=efa_ibv_cq_wc_read_byte_len \
+					-Wl,--wrap=efa_ibv_cq_wc_read_wc_flags \
+					-Wl,--wrap=efa_ibv_cq_wc_read_imm_data \
+					-Wl,--wrap=efa_ibv_cq_wc_is_unsolicited \
+					-Wl,--wrap=efa_ibv_cq_wc_read_sgid \
+					-Wl,--wrap=efa_ibv_get_cq_event \
+					-Wl,--wrap=efa_ibv_req_notify_cq \
+					-Wl,--wrap=calloc
+
+if HAVE_EFADV_CQ_EX
+prov_efa_test_efa_unit_test_LDFLAGS += -Wl,--wrap=efadv_create_cq
+endif HAVE_EFADV_CQ_EX
+
+if HAVE_NEURON
+prov_efa_test_efa_unit_test_LDFLAGS += -Wl,--wrap=neuron_alloc
+endif HAVE_NEURON
+
+if HAVE_EFADV_QUERY_MR
+prov_efa_test_efa_unit_test_LDFLAGS += -Wl,--wrap=efadv_query_mr
+endif HAVE_EFADV_QUERY_MR
+
+if HAVE_EFA_DATA_IN_ORDER_ALIGNED_128_BYTES
+prov_efa_test_efa_unit_test_LDFLAGS += -Wl,--wrap=ibv_query_qp_data_in_order
+endif
+
+if HAVE_EFADV_QUERY_QP_WQS
+prov_efa_test_efa_unit_test_LDFLAGS += -Wl,--wrap=efadv_query_qp_wqs
+endif HAVE_EFADV_QUERY_QP_WQS
+
+if HAVE_EFADV_QUERY_CQ
+prov_efa_test_efa_unit_test_LDFLAGS += -Wl,--wrap=efadv_query_cq
+endif HAVE_EFADV_QUERY_CQ
+
+if HAVE_EFADV_CREATE_COMP_CNTR
+prov_efa_test_efa_unit_test_LDFLAGS += -Wl,--wrap=efadv_create_comp_cntr \
+					-Wl,--wrap=ibv_destroy_comp_cntr \
+					-Wl,--wrap=ibv_inc_comp_cntr \
+					-Wl,--wrap=ibv_inc_err_comp_cntr \
+					-Wl,--wrap=ibv_set_comp_cntr \
+					-Wl,--wrap=ibv_set_err_comp_cntr \
+					-Wl,--wrap=ibv_read_comp_cntr \
+					-Wl,--wrap=ibv_read_err_comp_cntr \
+					-Wl,--wrap=ibv_qp_attach_comp_cntr
+endif HAVE_EFADV_CREATE_COMP_CNTR
+
+prov_efa_test_efa_unit_test_LIBS = $(efa_LIBS) $(linkback)
+
+endif ENABLE_EFA_UNIT_TEST
+
+if ENABLE_EFA_GTEST
+noinst_PROGRAMS += prov/efa/test/gtest/efa_gtest
+TESTS += prov/efa/test/gtest/efa_gtest
+
+nodist_prov_efa_test_gtest_efa_gtest_SOURCES = \
+	prov/efa/test/gtest/efa_gtest_main.cc \
+	prov/efa/test/gtest/efa_gtest_common_mocks.cc \
+	prov/efa/test/gtest/efa_gtest_common_resource.cc \
+	prov/efa/test/gtest/efa_gtest_common_helpers.c \
+	prov/efa/test/gtest/efa_gtest_rdm_pke_utils.c \
+	prov/efa/test/gtest/efa_gtest_rdm_av.cc \
+	prov/efa/test/gtest/efa_gtest_ah_utils.c \
+	prov/efa/test/gtest/efa_gtest_ah.cc \
+	prov/efa/test/gtest/efa_gtest_av_array.cc \
+	prov/efa/test/gtest/efa_gtest_av_array_utils.c \
+	prov/efa/test/gtest/efa_gtest_rdm_pke_rtm.cc \
+	prov/efa/test/gtest/efa_gtest_rdm_mr.cc \
+	prov/efa/test/gtest/efa_gtest_rdm_pke.cc \
+	prov/efa/test/gtest/efa_gtest_rdm_ope_helpers.c \
+	prov/efa/test/gtest/efa_gtest_rdm_ope.cc \
+	prov/efa/test/gtest/efa_gtest_cq.cc \
+	prov/efa/test/gtest/efa_gtest_rdm_cq_utils.c \
+	prov/efa/test/gtest/efa_gtest_rdm_cq.cc \
+	prov/efa/test/gtest/efa_gtest_rdm_cntr.cc \
+	prov/efa/test/gtest/efa_gtest_rdm_peer.cc \
+	prov/efa/test/gtest/efa_gtest_msg.cc \
+	prov/efa/test/gtest/efa_gtest_rma.cc \
+	prov/efa/test/gtest/efa_gtest_hmem.cc \
+	prov/efa/test/gtest/efa_gtest_tclass_utils.c \
+	prov/efa/test/gtest/efa_gtest_tclass.cc \
+	prov/efa/test/gtest/efa_gtest_domain_utils.c \
+	prov/efa/test/gtest/efa_gtest_domain.cc
+
+prov_efa_test_gtest_efa_gtest_CPPFLAGS = \
+	$(AM_CPPFLAGS) \
+	$(gtest_CPPFLAGS) \
+	$(efa_CPPFLAGS) \
+	-I$(top_srcdir)/include \
+	-I$(top_srcdir)/prov/efa/src \
+	-I$(top_srcdir)/prov/efa/src/rdm \
+	-I$(top_srcdir)/prov/efa/test/gtest
+
+prov_efa_test_gtest_efa_gtest_CXXFLAGS = -std=c++17
+
+prov_efa_test_gtest_efa_gtest_LDADD = \
+	$(gtest_LIBS) \
+	$(linkback)
+
+prov_efa_test_gtest_efa_gtest_LDFLAGS = \
+	-static \
+	$(efa_LDFLAGS) \
+	$(gtest_LDFLAGS) \
+	-Wl,--wrap=ibv_create_ah \
+	-Wl,--wrap=ibv_destroy_ah \
+	-Wl,--wrap=efadv_query_ah \
+	-Wl,--wrap=efa_av_reverse_av_add \
+	-Wl,--wrap=ofi_mr_map_insert \
+	-Wl,--wrap=cuda_set_sync_memops \
+	-Wl,--wrap=ofi_cuDevicePrimaryCtxGetState \
+	-Wl,--wrap=ofi_cuDevicePrimaryCtxSetFlags \
+	-Wl,--wrap=efa_ibv_cq_start_poll \
+	-Wl,--wrap=efa_ibv_cq_next_poll \
+	-Wl,--wrap=efa_ibv_cq_end_poll \
+	-Wl,--wrap=efa_ibv_cq_wc_read_opcode \
+	-Wl,--wrap=efa_ibv_cq_wc_read_vendor_err \
+	-Wl,--wrap=efa_ibv_cq_wc_read_qp_num \
+	-Wl,--wrap=efa_ibv_cq_wc_read_wc_flags \
+	-Wl,--wrap=efa_ibv_cq_wc_read_imm_data \
+	-Wl,--wrap=efa_ibv_cq_wc_read_byte_len \
+	-Wl,--wrap=efa_ibv_cq_wc_read_src_qp \
+	-Wl,--wrap=efa_ibv_cq_wc_read_slid \
+	-Wl,--wrap=efa_ibv_cq_wc_read_sgid \
+	-Wl,--wrap=efa_rdm_av_reverse_lookup \
+	-Wl,--wrap=efa_rdm_av_reverse_lookup_unsafe \
+	-Wl,--wrap=ofi_av_lookup_fi_addr \
+	-Wl,--wrap=efa_rdm_pke_clone \
+	-Wl,--wrap=efa_qp_post_recv \
+	-Wl,--wrap=efa_qp_post_send \
+	-Wl,--wrap=efa_qp_post_read \
+	-Wl,--wrap=efa_qp_post_write \
+	-Wl,--wrap=efadv_create_qp_ex \
+	-Wl,--wrap=efa_rdm_ep_post_queued_pkts \
+	-Wl,--wrap=efa_rdm_pke_fill_data \
+	-Wl,--wrap=efa_rdm_pke_read \
+	-Wl,--wrap=ibv_modify_qp \
+	-Wl,--wrap=malloc
+
+if HAVE_EFADV_QUERY_QP_WQS
+prov_efa_test_gtest_efa_gtest_LDFLAGS += -Wl,--wrap=efadv_query_qp_wqs
+endif HAVE_EFADV_QUERY_QP_WQS
+
+prov_efa_test_gtest_efa_gtest_LIBS = $(linkback)
+
+endif ENABLE_EFA_GTEST
+
+efa_CPPFLAGS += \
+	-I$(top_srcdir)/prov/efa/src/ \
+	-I$(top_srcdir)/prov/efa/src/rdm/
+
+rdmainclude_HEADERS += \
+	prov/efa/src/fi_ext_efa.h
+
+if HAVE_EFA_DL
+pkglib_LTLIBRARIES += libefa-fi.la
+libefa_fi_la_SOURCES = $(_efa_files) $(_efa_headers) $(common_srcs)
+libefa_fi_la_CPPFLAGS = $(AM_CPPFLAGS) $(efa_CPPFLAGS)
+libefa_fi_la_LDFLAGS = \
+    -module -avoid-version -shared -export-dynamic $(efa_LDFLAGS)
+libefa_fi_la_LIBADD = $(linkback) $(efa_LIBS)
+libefa_fi_la_DEPENDENCIES = $(linkback)
+else !HAVE_EFA_DL
+src_libfabric_la_SOURCES += $(_efa_files) $(_efa_headers)
+src_libfabric_la_CPPFLAGS += $(efa_CPPFLAGS)
+src_libfabric_la_LDFLAGS += $(efa_LDFLAGS)
+src_libfabric_la_LIBADD += $(efa_LIBS)
+endif !HAVE_EFA_DL
+
+prov_install_man_pages += man/man7/fi_efa.7
+
+
+endif HAVE_EFA
+
+efa-doxygen:
+	doxygen prov/efa/docs/Doxyfile
+
+prov_dist_man_pages += man/man7/fi_efa.7
