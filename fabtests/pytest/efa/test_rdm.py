@@ -1,0 +1,375 @@
+from efa.efa_common import (efa_run_client_server_test, DIRECT_SIZES,
+                            memory_type_list_all, memory_type_list_bi_dir, memory_type_list_device_to_device)
+from common import (perf_progress_model_cli,
+                    PERF_SIZES, PERF_PR_CI, RANGE_SIZES, INJECT_SIZES)
+
+import pytest
+import copy
+
+
+@pytest.mark.pr_ci
+@pytest.mark.fabric(params=["efa", "efa-direct"])
+@pytest.mark.functional
+def test_rdm_efa(cmdline_args, completion_semantic, fabric):
+    from common import ClientServerTest
+    test = ClientServerTest(cmdline_args, "fi_rdm", completion_semantic=completion_semantic, fabric=fabric)
+    test.run()
+
+# Test rdm bw with 1M msg size, without specifying fabric.
+# It should skip efa-direct and choose efa fabric as the
+# former one doesn't support 1M msg size for FI_MSG
+@pytest.mark.functional
+def test_rdm_bw_efa_msg_1M(cmdline_args, completion_semantic):
+    from common import ClientServerTest
+    test = ClientServerTest(cmdline_args, "fi_rdm_bw -S 1048576", completion_semantic=completion_semantic, fabric=None)
+    test.run()
+
+# This test skips efa-direct because it requests FI_ORDER_SAS
+@pytest.mark.pr_ci
+@pytest.mark.functional
+def test_rdm_bw_functional_efa(cmdline_args, completion_semantic):
+    from common import ClientServerTest
+    test = ClientServerTest(cmdline_args, "fi_flood -e rdm -v -T 1", completion_semantic=completion_semantic, fabric="efa")
+    test.run()
+
+# Functional check of the efa-direct no-FI_CONTEXT2 path (the GDA usecase):
+# "-M context2" clears FI_CONTEXT2 from the hints, so the provider must
+# complete send/recv without ever dereferencing the caller's context buffer.
+# Kept to a single small size and short iterations so it is quick for PR CI.
+@pytest.mark.pr_ci
+@pytest.mark.functional
+def test_rdm_bw_no_context2(cmdline_args):
+    from common import ClientServerTest
+    test = ClientServerTest(cmdline_args, "fi_rdm_bw --fi-version 2.7 -M context2 -S 1024 -j 0",
+                            completion_semantic="transmit_complete",
+                            fabric="efa-direct", iteration_type="short")
+    test.run()
+
+@pytest.mark.fabric(params=["efa", "efa-direct"])
+@pytest.mark.message_sizes(default_efa=PERF_SIZES, default_efa_direct=DIRECT_SIZES,
+                           pr_ci_efa=PERF_PR_CI, pr_ci_efa_direct=DIRECT_SIZES)
+@pytest.mark.parametrize("iteration_type",
+                         [pytest.param("short", marks=pytest.mark.short),
+                          pytest.param("standard", marks=pytest.mark.standard)])
+@pytest.mark.pr_ci
+@pytest.mark.pr_ci_hmem
+@pytest.mark.memory_type(memory_type_list_bi_dir, pr_ci_hmem=memory_type_list_all)
+def test_rdm_pingpong(cmdline_args, iteration_type, completion_semantic,
+                      memory_type, completion_type, fabric, message_sizes):
+    command = "fi_rdm_pingpong"  + " " + perf_progress_model_cli
+    efa_run_client_server_test(cmdline_args, command, iteration_type,
+                               completion_semantic, memory_type,
+                               message_sizes,
+                               completion_type=completion_type, fabric=fabric)
+
+@pytest.mark.fabric(params=["efa", "efa-direct"])
+@pytest.mark.message_sizes(default_efa=RANGE_SIZES, default_efa_direct=DIRECT_SIZES)
+@pytest.mark.functional
+@pytest.mark.memory_type(memory_type_list_bi_dir)
+def test_rdm_pingpong_range(cmdline_args, completion_semantic, memory_type, message_sizes, fabric):
+    efa_run_client_server_test(cmdline_args, "fi_rdm_pingpong", "short",
+                               completion_semantic, memory_type,
+                               message_sizes, fabric=fabric)
+
+@pytest.mark.fabric(params=["efa", "efa-direct"])
+@pytest.mark.message_sizes(default_efa=INJECT_SIZES, default_efa_direct=DIRECT_SIZES)
+@pytest.mark.functional
+def test_rdm_pingpong_no_inject_range(cmdline_args, completion_semantic, message_sizes, fabric):
+    efa_run_client_server_test(cmdline_args, "fi_rdm_pingpong -j 0", "short",
+                               completion_semantic, "host_to_host",
+                               message_sizes, fabric=fabric)
+
+# efa-direct does not support tagged
+@pytest.mark.message_sizes(default_efa=PERF_SIZES, pr_ci_efa=PERF_PR_CI)
+@pytest.mark.parametrize("iteration_type",
+                         [pytest.param("short", marks=pytest.mark.short),
+                          pytest.param("standard", marks=pytest.mark.standard)])
+@pytest.mark.pr_ci
+@pytest.mark.pr_ci_hmem
+@pytest.mark.memory_type(memory_type_list_bi_dir, pr_ci_hmem=memory_type_list_device_to_device)
+def test_rdm_tagged_pingpong(cmdline_args, iteration_type, completion_semantic, memory_type, completion_type, message_sizes):
+    command = "fi_rdm_tagged_pingpong"  + " " + perf_progress_model_cli
+    efa_run_client_server_test(cmdline_args, command, iteration_type,
+                               completion_semantic, memory_type, message_sizes, completion_type=completion_type,
+                               fabric="efa")
+
+@pytest.mark.message_sizes(default_efa=RANGE_SIZES)
+@pytest.mark.functional
+@pytest.mark.memory_type(memory_type_list_bi_dir)
+def test_rdm_tagged_pingpong_range(cmdline_args, completion_semantic, memory_type, message_sizes):
+    efa_run_client_server_test(cmdline_args, "fi_rdm_tagged_pingpong", "short",
+                               completion_semantic, memory_type, message_sizes,
+                               fabric="efa")
+
+@pytest.mark.message_sizes(default_efa=PERF_SIZES)
+@pytest.mark.parametrize("iteration_type",
+                         [pytest.param("short", marks=pytest.mark.short),
+                          pytest.param("standard", marks=pytest.mark.standard)])
+@pytest.mark.memory_type(memory_type_list_all)
+def test_rdm_tagged_bw(cmdline_args, iteration_type, completion_semantic, memory_type, completion_type, message_sizes):
+    command = "fi_rdm_tagged_bw"  + " " + perf_progress_model_cli
+    efa_run_client_server_test(cmdline_args, command, iteration_type,
+                               completion_semantic, memory_type, message_sizes, completion_type=completion_type,
+                               fabric="efa")
+
+@pytest.mark.message_sizes(default_efa=RANGE_SIZES)
+@pytest.mark.functional
+@pytest.mark.memory_type(memory_type_list_all)
+def test_rdm_tagged_bw_range(cmdline_args, completion_semantic, memory_type, message_sizes):
+    efa_run_client_server_test(cmdline_args, "fi_rdm_tagged_bw", "short",
+                               completion_semantic, memory_type, message_sizes, fabric="efa")
+
+@pytest.mark.message_sizes(default_efa=INJECT_SIZES)
+@pytest.mark.functional
+def test_rdm_tagged_bw_no_inject_range(cmdline_args, completion_semantic, message_sizes):
+    efa_run_client_server_test(cmdline_args, "fi_rdm_tagged_bw -j 0", "short",
+                               completion_semantic, "host_to_host", message_sizes, fabric="efa")
+
+# Testing both power-2 and non-power-2 sizes
+@pytest.mark.functional
+@pytest.mark.parametrize("env_vars", [["FI_EFA_TX_SIZE=64"], ["FI_EFA_RX_SIZE=64"], ["FI_EFA_TX_SIZE=64", "FI_EFA_RX_SIZE=64"], ["FI_EFA_TX_SIZE=43", "FI_EFA_RX_SIZE=51"]])
+@pytest.mark.memory_type(memory_type_list_all)
+def test_rdm_tagged_bw_small_tx_rx(cmdline_args, completion_semantic, memory_type, completion_type, env_vars):
+    cmdline_args_copy = copy.copy(cmdline_args)
+    for env_var in env_vars:
+        cmdline_args_copy.append_environ(env_var)
+    # Use a window size larger than tx/rx size
+    efa_run_client_server_test(cmdline_args_copy, "fi_rdm_tagged_bw -W 128", "short",
+                               completion_semantic, memory_type, "all", completion_type=completion_type,
+                               fabric="efa")
+
+@pytest.mark.functional
+@pytest.mark.memory_type(memory_type_list_all)
+def test_rdm_tagged_bw_small_recv_window(cmdline_args, completion_semantic, memory_type, completion_type):
+    cmdline_args_copy = copy.copy(cmdline_args)
+    cmdline_args_copy.append_environ("FI_EFA_RECVWIN_SIZE=1")
+    efa_run_client_server_test(cmdline_args_copy, "fi_rdm_tagged_bw -W 128", "short",
+                               completion_semantic, memory_type, "all", completion_type=completion_type,
+                               fabric="efa")
+
+@pytest.mark.message_sizes(default_efa=RANGE_SIZES)
+@pytest.mark.functional
+@pytest.mark.memory_type(memory_type_list_all)
+def test_rdm_tagged_bw_use_fi_more(cmdline_args, completion_semantic, memory_type, message_sizes):
+    command = "fi_rdm_tagged_bw -w 0 --use-fi-more --sync-comp " + completion_semantic
+    efa_run_client_server_test(cmdline_args, command,
+                               "short", completion_semantic, memory_type, message_sizes, fabric="efa")
+
+# efa-direct does not support atomic
+@pytest.mark.parametrize("iteration_type",
+                         [pytest.param("short", marks=pytest.mark.short),
+                          pytest.param("standard", marks=pytest.mark.standard)])
+@pytest.mark.pr_ci
+@pytest.mark.pr_ci_hmem
+@pytest.mark.memory_type(memory_type_list_all, pr_ci_hmem=memory_type_list_device_to_device)
+def test_rdm_atomic(cmdline_args, iteration_type, completion_semantic, memory_type):
+    from copy import copy
+
+    from common import ClientServerTest
+
+    if "neuron" in memory_type:
+        pytest.skip("Neuron does not fully support atomics")
+
+    # the rdm_atomic test's run time has a high variance when running single c6gn instance.
+    # the issue is tracked in:  https://github.com/ofiwg/libfabric/issues/7002
+    # to mitigate the issue, set the maximum timeout of fi_rdm_atomic to 1800 seconds.
+    cmdline_args_copy = copy(cmdline_args)
+    command = "fi_rdm_atomic"  + " " + perf_progress_model_cli
+    test = ClientServerTest(cmdline_args_copy, "fi_rdm_atomic", iteration_type, completion_semantic,
+                            memory_type=memory_type, timeout=1800, fabric="efa")
+    test.run()
+
+@pytest.mark.pr_ci
+@pytest.mark.functional
+def test_rdm_tagged_peek(cmdline_args):
+    from copy import copy
+
+    from common import ClientServerTest
+
+    test = ClientServerTest(cmdline_args, "fi_rdm_tagged_peek", timeout=1800)
+    test.run()
+
+# This test is run in serial mode because it takes a lot of memory
+# It is skipped for efa-direct because 1GB exceeds device max msg size
+@pytest.mark.serial
+@pytest.mark.functional
+def test_rdm_pingpong_1G(cmdline_args, completion_semantic):
+    # Default window size is 64 resulting in 128GB being registered, which
+    # exceeds max number of registered host pages
+    efa_run_client_server_test(cmdline_args, "fi_rdm_pingpong -W 1", 2,
+                               completion_semantic=completion_semantic, message_size=1073741824,
+                               memory_type="host_to_host", warmup_iteration_type=0, fabric="efa")
+
+@pytest.mark.fabric(params=["efa", "efa-direct"])
+@pytest.mark.message_sizes(default_efa=PERF_SIZES, default_efa_direct=DIRECT_SIZES)
+@pytest.mark.functional
+@pytest.mark.parametrize("comp_method", ["sread", "fd"])
+@pytest.mark.memory_type(memory_type_list_bi_dir)
+def test_rdm_pingpong_sread(cmdline_args, completion_semantic, memory_type,
+                            support_sread, comp_method, fabric, message_sizes):
+    if not support_sread:
+        pytest.skip("sread not supported by efa device.")
+    additional_env = ''
+    if fabric == "efa" and comp_method == "fd":
+        if cmdline_args.server_id == cmdline_args.client_id:
+            pytest.skip("FI_WAIT_FD not supported for EFA protocol with SHM enabled")
+        additional_env = "FI_EFA_ENABLE_SHM_TRANSFER=0"
+    efa_run_client_server_test(cmdline_args, f"fi_rdm_pingpong -c {comp_method}", "short",
+                               completion_semantic, memory_type,
+                               message_sizes,
+                               fabric=fabric, additional_env=additional_env)
+
+# These tests skip efa-direct because efa-direct does not
+# do memory registrations on behalf of the application
+@pytest.mark.functional
+@pytest.mark.serial
+@pytest.mark.run_last
+def test_mr_exhaustion_rdm_pingpong(cmdline_args, completion_semantic):
+    import os
+    binpath = cmdline_args.binpath or ""
+    if not os.path.exists(os.path.join(binpath, "fi_efa_exhaust_mr_reg_rdm_pingpong")):
+        pytest.skip("fi_efa_exhaust_mr_reg_rdm_pingpong requires efadv")
+    efa_run_client_server_test(cmdline_args, "fi_efa_exhaust_mr_reg_rdm_pingpong", "short",
+                               completion_semantic, "host_to_host", "all", timeout=1000,
+                               fabric="efa")
+
+@pytest.mark.message_sizes(default_efa=PERF_SIZES, pr_ci_efa=PERF_PR_CI)
+@pytest.mark.parametrize("mr_cache", [True, False])
+@pytest.mark.parametrize("iteration_type",
+                         [pytest.param("short", marks=pytest.mark.short),
+                          pytest.param("standard", marks=pytest.mark.standard)])
+@pytest.mark.pr_ci
+@pytest.mark.pr_ci_hmem
+@pytest.mark.memory_type(memory_type_list_bi_dir, pr_ci_hmem=memory_type_list_device_to_device)
+def test_rdm_pingpong_no_mr_local(cmdline_args, iteration_type, completion_semantic,
+                      memory_type, completion_type, mr_cache, message_sizes):
+    command = "fi_rdm_pingpong -M mr_local"  + " " + perf_progress_model_cli
+
+    additional_env = ''
+    if not mr_cache:
+        additional_env = 'FI_EFA_MR_CACHE_ENABLE=0'
+
+    efa_run_client_server_test(cmdline_args, command, iteration_type,
+                               completion_semantic, memory_type, message_sizes,
+                               completion_type=completion_type, fabric="efa",
+                               additional_env=additional_env)
+
+@pytest.mark.message_sizes(default_efa=PERF_SIZES, pr_ci_efa=PERF_PR_CI)
+@pytest.mark.parametrize("mr_cache", [True, False])
+@pytest.mark.parametrize("iteration_type",
+                         [pytest.param("short", marks=pytest.mark.short),
+                          pytest.param("standard", marks=pytest.mark.standard)])
+@pytest.mark.pr_ci
+@pytest.mark.pr_ci_hmem
+@pytest.mark.memory_type(memory_type_list_bi_dir, pr_ci_hmem=memory_type_list_device_to_device)
+def test_rma_pingpong_no_mr_local(cmdline_args, iteration_type, completion_semantic,
+                      memory_type, mr_cache, message_sizes):
+    command = "fi_rma_pingpong -o writedata -M mr_local"  + " " + perf_progress_model_cli
+
+    additional_env = ''
+    if not mr_cache:
+        additional_env = 'FI_EFA_MR_CACHE_ENABLE=0'
+
+    efa_run_client_server_test(cmdline_args, command, iteration_type,
+                               completion_semantic, memory_type, message_sizes,
+                               completion_type="queue", fabric="efa",
+                               additional_env=additional_env)
+
+
+@pytest.mark.pr_ci
+@pytest.mark.functional
+@pytest.mark.serial
+@pytest.mark.parametrize("unexpected_path", [True, False])
+# TODO: Add test with (1) larger message size that uses the long read protocol
+# and (2) SHM provider with CMA protocol after fixing the test to poll CQ while
+# waiting for the server to get send completions
+@pytest.mark.parametrize("msg_size", [1, 1024, 8192, 24756])
+# @pytest.mark.parametrize("msg_count", [1, 1024, 2048]) # below and above shm's default rx size
+def test_implicit_av(cmdline_args, unexpected_path, msg_size):
+    import os
+    binpath = cmdline_args.binpath or ""
+    if not os.path.exists(os.path.join(binpath, "fi_efa_implicit_av_test")):
+        pytest.skip("implicit AV test not found")
+
+    if (cmdline_args.server_id == cmdline_args.client_id) and unexpected_path:
+        pytest.skip("SHM provider is not guaranteed to generate TX completions without posted receives")
+    test_cmd = f"fi_efa_implicit_av_test -L -c 5 -S {msg_size}"
+    if unexpected_path:
+        test_cmd += " -X"
+
+    efa_run_client_server_test(cmdline_args, test_cmd, "short",
+                               "transmit_complete", "host_to_host", "all", fabric="efa")
+
+@pytest.mark.pr_ci
+@pytest.mark.functional
+@pytest.mark.serial
+# TODO: Add test with larger message size that uses the long read protocol after
+# fixing the test to poll CQ while waiting for the server to get send completions
+@pytest.mark.parametrize("msg_size", [1, 1024, 8192, 24756])
+def test_implicit_av_limited_av_size_expected_path(cmdline_args, msg_size):
+    import os
+    binpath = cmdline_args.binpath or ""
+    if not os.path.exists(os.path.join(binpath, "fi_efa_implicit_av_test")):
+        pytest.skip("implicit AV test not found")
+
+    additional_env = 'FI_EFA_IMPLICIT_AV_SIZE=3'
+
+    test_cmd = f"fi_efa_implicit_av_test -L -c 5 -S {msg_size}"
+
+    efa_run_client_server_test(cmdline_args, test_cmd, "short",
+                               "transmit_complete", "host_to_host", "all", fabric="efa",
+                               additional_env=additional_env, timeout=30)
+
+@pytest.mark.functional
+@pytest.mark.serial
+# This test is expected to fail because the implicit AV size of 3 is smaller than
+# the number of server endpoints of 5. So implicit AV entries will get evicted
+# on the client and cause the test to hang.
+@pytest.mark.xfail(strict=True)
+# TODO: Add test with larger message size that uses the long read protocol after
+# fixing the test to poll CQ while waiting for the server to get send completions
+@pytest.mark.parametrize("msg_size", [1, 1024, 8192, 24756])
+def test_implicit_av_limited_av_size_unexpected_path(cmdline_args, msg_size):
+    import os
+    binpath = cmdline_args.binpath or ""
+    if not os.path.exists(os.path.join(binpath, "fi_efa_implicit_av_test")):
+        pytest.skip("implicit AV test not found")
+
+    if cmdline_args.server_id == cmdline_args.client_id:
+        pytest.skip("This test will only fail for the EFA protocol path - which requires 2 nodes.")
+
+    additional_env = 'FI_EFA_IMPLICIT_AV_SIZE=3'
+
+    test_cmd = f"fi_efa_implicit_av_test -L -X -c 5 -S {msg_size}"
+
+    efa_run_client_server_test(cmdline_args, test_cmd, "short",
+                               "transmit_complete", "host_to_host", "all", fabric="efa",
+                               additional_env=additional_env, timeout=15)
+
+@pytest.mark.functional
+def test_rmd_tagged_pingpong_truncate_error(cmdline_args, completion_semantic):
+    if cmdline_args.server_id == cmdline_args.client_id:
+        pytest.skip("client hits an assertion in debug mode in case of intra-node")
+    executable = {"server": "fi_rdm_tagged_pingpong --timeout 1",
+                  "client": "fi_rdm_tagged_pingpong --expect-error 265"}
+    message_size = {"server": 2000001,
+                    "client": 2000000}
+    might_fail = {"server": True,
+                  "client": False}
+
+    efa_run_client_server_test(cmdline_args, executable, "short",
+                               completion_semantic, "host_to_host",
+                               message_size=message_size, fabric="efa",
+                               timeout=15, might_fail=might_fail)
+
+@pytest.mark.functional
+@pytest.mark.fabric(params=["efa", "efa-direct"])
+@pytest.mark.parametrize("num_eps", [8, 16, 32])
+@pytest.mark.parametrize("iteration_type",
+                         [pytest.param("short", marks=pytest.mark.short),
+                          pytest.param("standard", marks=pytest.mark.standard)])
+def test_rdm_bw_mt_thread_completion(cmdline_args, iteration_type, num_eps, fabric):
+    from common import ClientServerTest
+    test = ClientServerTest(cmdline_args, f"fi_rdm_bw_mt -g -n {num_eps} --threading completion",
+                            iteration_type, "transmit_complete", fabric=fabric)
+    test.run()

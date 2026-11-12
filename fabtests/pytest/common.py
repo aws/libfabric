@@ -1,0 +1,971 @@
+import copy
+import time
+import json
+import errno
+import os
+import re
+import shlex
+import subprocess
+import functools
+from datetime import datetime
+from subprocess import Popen, TimeoutExpired, run
+from tempfile import NamedTemporaryFile
+from time import sleep
+
+from retrying import retry
+import pytest
+
+
+perf_progress_model_cli = "--data-progress manual --control-progress unified"
+SERVER_RESTART_DELAY_MS = 10_000
+CLIENT_RETRY_INTERVAL_MS = 1_000
+
+# Shared non-interactive SSH command.
+bssh = "ssh -n -o StrictHostKeyChecking=no -o ConnectTimeout=30 -o BatchMode=yes"
+bssh_tty = bssh + " -tt"
+
+# Polling limits for Linux xdist OOB port readiness.
+OOB_POLL_INTERVAL_SEC = 0.5
+PORT_CLEAR_TIMEOUT_SEC = 10
+SERVER_LISTEN_TIMEOUT_SEC = 30
+
+
+class SshConnectionError(Exception):
+
+    def __init__(self):
+        super().__init__(self, "Ssh connection failed")
+
+
+def is_ssh_connection_error(exception):
+    return isinstance(exception, SshConnectionError)
+
+
+def has_ssh_connection_err_msg(output):
+    err_msgs = ["Connection closed",
+                "Connection reset by peer",
+                "Connection refused",
+                r"ssh_dispatch_run_fatal: .* incorrect signature"]
+
+    for msg in err_msgs:
+        if len(re.findall(msg, output)) > 0:
+            return True
+
+    return False
+
+
+@functools.lru_cache(10)
+@retry(retry_on_exception=is_ssh_connection_error, stop_max_attempt_number=3, wait_fixed=5000)
+def num_cuda_devices(ip):
+    proc = run("ssh {} nvidia-smi -L".format(ip), shell=True,
+               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+               timeout=60, encoding="utf-8")
+
+    if has_ssh_connection_err_msg(proc.stderr):
+        raise SshConnectionError()
+
+    # the command "nvidia-smi -L" print 1 line for each GPU
+    # An example line is like:
+    #  GPU 0: NVIDIA A100-SXM4-40GB (UUID: GPU-ddba3c80-ed95-c778-0c47-8cdf2ce99787)
+    # Therefore here we count number of lines that starts with GPU
+    result = 0
+    lines = proc.stdout.split("\n")
+    for line in lines:
+        if line.find("GPU") == 0:
+            result += 1
+
+    return result
+
+
+@functools.lru_cache(10)
+def num_neuron_devices(ip):
+    from efa.efa_common import get_neuron_ls_output
+    return len(get_neuron_ls_output(ip))
+
+
+@functools.lru_cache(10)
+def num_neuron_cores_on_device(ip, device_id):
+    from efa.efa_common import get_neuron_ls_output
+    devices = get_neuron_ls_output(ip)
+    if not devices:
+        raise subprocess.CalledProcessError(1, "neuron-ls")
+    return devices[device_id]["nc_count"]
+
+
+@retry(retry_on_exception=is_ssh_connection_error, stop_max_attempt_number=3, wait_fixed=5000)
+def is_neuron_device_available(ip, device_id):
+    proc = run("ssh {} /opt/aws/neuron/bin/neuron-ls -j".format(ip), shell=True,
+               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+               timeout=60, encoding="utf-8")
+
+    if has_ssh_connection_err_msg(proc.stderr):
+        raise SshConnectionError()
+
+    proc.check_returncode()
+    processes = json.loads(proc.stdout)[device_id]["neuron_processes"]
+    return len(processes) == 0
+
+
+def wait_until_neuron_device_available(ip, device_id):
+    numtry = 0
+    maxtry = 100
+    for numtry in range(maxtry):
+        if is_neuron_device_available(ip, device_id):
+            return
+
+        time.sleep(1)
+
+    raise RuntimeError("Error: neuron device {} is not available after {} tries".format(device_id, maxtry))
+
+
+@functools.lru_cache(10)
+@retry(retry_on_exception=is_ssh_connection_error, stop_max_attempt_number=3, wait_fixed=5000)
+def num_rocr_devices(ip):
+    proc = run("ssh {} rocm-smi --alldevices".format(ip), shell=True,
+               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+               timeout=60, encoding="utf-8")
+
+    if has_ssh_connection_err_msg(proc.stderr):
+        raise SshConnectionError()
+
+    # Count lines that start with a digit (device number)
+    result = 0
+    lines = proc.stdout.split("\n")
+    for line in lines:
+        line = line.strip()
+        if line and line[0].isdigit():
+            result += 1
+
+    return result
+
+
+def num_hmem_devices(ip, hmem_type):
+    function_table = {
+        "cuda" : num_cuda_devices,
+        "neuron" : num_neuron_devices,
+        "rocr": num_rocr_devices,
+    }
+
+    if hmem_type not in function_table:
+        raise RuntimeError("Error: unknown hmem type {}".format(hmem_type))
+
+    return function_table[hmem_type](ip)
+
+
+def has_cuda(ip):
+    return num_cuda_devices(ip) > 0
+
+
+def has_neuron(ip):
+    return num_neuron_devices(ip) > 0
+
+
+def has_rocr(ip):
+    return num_rocr_devices(ip) > 0
+
+
+@retry(retry_on_exception=is_ssh_connection_error, stop_max_attempt_number=3, wait_fixed=5000)
+def has_hmem_support(cmdline_args, ip):
+    binpath = cmdline_args.binpath or ""
+    cmd = "timeout " + str(cmdline_args.timeout) \
+          + " " + os.path.join(binpath, "fi_check_hmem") \
+          + " " + "-p " + cmdline_args.provider
+    if cmdline_args.environments:
+        cmd = cmdline_args.environments + " " + cmd
+    proc = run("ssh {} {}".format(ip, cmd),
+               stdout=subprocess.PIPE,
+               stderr=subprocess.STDOUT,
+               shell=True,
+               universal_newlines=True)
+    if has_ssh_connection_err_msg(proc.stdout):
+        raise SshConnectionError()
+
+    return proc.returncode == 0
+
+
+PASS = 1
+SKIP = 2
+FAIL = 3
+
+
+def get_fabtests_log_dir():
+    """Return FABTESTS_LOG_DIR, defaulting to ~/fabtest_logs."""
+    return os.environ.get(
+        "FABTESTS_LOG_DIR", os.path.expanduser("~/fabtest_logs"))
+
+
+def make_test_log_paths():
+    """Create unique server and client log paths for the current test."""
+    test_id = os.environ.get(
+        "PYTEST_CURRENT_TEST", "unknown_test").split(" (")[0]
+    safe_test_id = re.sub(r"[^A-Za-z0-9._-]", "_", test_id)[:180]
+    name_parts = [
+        safe_test_id,
+        datetime.now().strftime("%Y%m%d-%H%M%S.%f"),
+    ]
+    worker = os.environ.get("PYTEST_XDIST_WORKER")
+    if worker:
+        name_parts.append(worker)
+
+    log_dir = get_fabtests_log_dir()
+    os.makedirs(log_dir, exist_ok=True)
+    base_path = os.path.join(log_dir, "_".join(name_parts))
+    return base_path + ".server.log", base_path + ".client.log"
+
+
+def remove_test_logs(*log_paths):
+    for log_path in log_paths:
+        os.unlink(log_path)
+
+
+def check_returncode(returncode, strict):
+    """
+    check one return code
+    @param returncode: input
+    @param strict: whether to use strict mode, which treat all error as failure.
+                   In none strict mode, ENODATA and ENOSYS is treated as pass
+    @return: a tuple with return type (PASS, SKIP and FAIL), and a messge.
+             when return type is PASs, message will be None
+    """
+    if returncode == 0:
+        return PASS, None
+
+    if not strict:
+        if returncode == errno.ENODATA:
+            return SKIP, "ENODATA"
+
+        if returncode == errno.ENOSYS:
+            return SKIP, "ENOSYS"
+
+    error_msg = "returncode {}".format(returncode)
+    # all tests are run under the timeout command
+    # which will return 124 when timeout expired.
+    if returncode == 124:
+        error_msg += ", timeout"
+
+    return FAIL, error_msg
+
+def check_returncode_list(returncode_list, strict, extra_fail_message=None):
+    """
+    check a list of returncode, and call pytest's handler accordingly.
+        If there is failure in return, call pytest.fail()
+        If there is no failure, but there is skip in return, call pytest.skip()
+        If there is no failure or skip, do nothing
+    @param resultcode_list: a list of return code
+    @param strict: a boolean indicating wether strict mode should be used.
+    @param extra_fail_message: optional text appended to the failure reason.
+    @return: no return
+    """
+    result = PASS
+    reason = None
+    for returncode in returncode_list:
+        # note that failure has higher priority than skip, therefore:
+        #
+        #     if a failure is encoutered, we break out immediately
+        #     if a skip is encountered, we record it and continue
+        #
+        # this ensures skip can be overwritten by failure
+        cur_result,cur_reason = check_returncode(returncode, strict)
+
+        if cur_result != PASS:
+            result = cur_result
+            reason = cur_reason
+
+        if cur_result == FAIL:
+            break
+
+    if result == FAIL:
+        if extra_fail_message:
+            reason = "{}\n{}".format(reason, extra_fail_message)
+        pytest.fail(reason)
+
+    if result == SKIP:
+        pytest.skip(reason)
+
+
+class WaitableProcess:
+    def __init__(self, process, timeout, output_file):
+        self.process = process
+        self._returncode = None
+        self.timeout = timeout
+        self.output_file = output_file
+        self._complete = False
+        self._output = ""
+
+    def wait(self, timeout=None):
+        if self._complete:
+            return
+
+        exception = None
+        try:
+            self._output, _ = self.process.communicate(timeout=timeout or self.timeout)
+        except Exception as e:
+            exception = e
+            self.process.terminate()
+
+        if (self.output_file):
+            self.output_file.close()
+
+        self._returncode = self.process.returncode
+        self._complete = True
+
+        if exception:
+            raise exception
+
+    @property
+    def output(self):
+        if self.output_file:
+            with open(self.output_file.name, "r") as f:
+                self._output = f.read()
+
+        return self._output
+
+    @property
+    def returncode(self):
+        if not self._complete:
+            self.wait()
+        return self._returncode
+
+class UnitTest:
+
+    def __init__(self, cmdline_args, base_command, is_negative=False, failing_warn_msgs=None):
+        if isinstance(failing_warn_msgs, str):
+            failing_warn_msgs = [failing_warn_msgs]
+
+        if failing_warn_msgs:
+            self._cmdline_args = copy.copy(cmdline_args)
+            self._cmdline_args.append_environ("FI_LOG_LEVEL=warn")
+        else:
+            self._cmdline_args = cmdline_args
+
+        self._failing_warn_msgs = failing_warn_msgs
+        self._base_command = base_command
+        self._is_negative = is_negative
+        if "neuron" in base_command and "PYTEST_XDIST_WORKER" in os.environ:
+            host_ip = self._cmdline_args.server_id
+            worker_id = int(os.environ["PYTEST_XDIST_WORKER"].replace("gw", ""))
+            neuron_device_id = worker_id % num_neuron_devices(host_ip)
+            num_cores = num_neuron_cores_on_device(host_ip, neuron_device_id)
+            additional_environment = "NEURON_RT_VISIBLE_CORES={}".format(
+                neuron_device_id * num_cores)
+            wait_until_neuron_device_available(host_ip, neuron_device_id)
+        else:
+            additional_environment = None
+
+        self._command = self._cmdline_args.populate_command(base_command, "host", additional_environment=additional_environment)
+
+    @retry(retry_on_exception=is_ssh_connection_error, stop_max_attempt_number=3, wait_fixed=5000)
+    def run(self):
+        if self._cmdline_args.is_test_excluded(self._base_command, self._is_negative):
+            pytest.skip("excluded")
+
+        # start running
+        outfile = NamedTemporaryFile(prefix="fabtests_server.out.").name
+        process = Popen(self._command + "> " + outfile + " 2>&1", shell=True)
+
+        timeout = False
+        try:
+            process.wait(timeout=self._cmdline_args.timeout)
+        except TimeoutExpired:
+            process.terminate()
+            timeout = True
+
+        output = open(outfile).read()
+        print("")
+        print("command: " + self._command)
+        if has_ssh_connection_err_msg(output):
+            print("encountered ssh connection issue")
+            raise SshConnectionError()
+
+        print("stdout: ")
+        print(output)
+        os.unlink(outfile)
+
+        assert not timeout, "timed out"
+        check_returncode_list([process.returncode], self._cmdline_args.strict_fabtests_mode)
+
+        if self._failing_warn_msgs:
+            for msg in self._failing_warn_msgs:
+                assert output.find(msg) == -1
+
+
+def _run_ssh_probe(host_id, command):
+    """Run `command` on `host_id` over SSH and return stdout."""
+    remote_command = "/bin/bash --login -c {}".format(shlex.quote(command))
+    try:
+        proc = run("{} {} {}".format(bssh, host_id, shlex.quote(remote_command)),
+                   shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                   timeout=60, encoding="utf-8")
+    except TimeoutExpired:
+        raise SshConnectionError()
+    if has_ssh_connection_err_msg(proc.stderr):
+        raise SshConnectionError()
+    if proc.returncode != 0:
+        raise RuntimeError("'{}' failed on {}: {}".format(
+            command, host_id, proc.stderr.strip()))
+    return proc.stdout
+
+
+@functools.lru_cache(10)
+def _is_linux_host(host_id):
+    """Return whether `host_id` runs Linux."""
+    return _run_ssh_probe(host_id, "uname -s").strip() == "Linux"
+
+
+def _oob_port_has_listener(host_id, port):
+    """Return whether TCP `port` has a listener on `host_id`."""
+    output = _run_ssh_probe(host_id, "ss -ltn")
+    # Match the port in the local-address column.
+    suffix = ":{}".format(port)
+    for line in output.splitlines():
+        fields = line.split()
+        if len(fields) >= 4 and fields[3].endswith(suffix):
+            return True
+    return False
+
+
+def _oob_port_from_command(command):
+    """Return the explicit `-E=<port>` value, if present."""
+    match = re.search(r"(?:^|\s)-E=(\d+)(?![\w=-])", command)
+    return int(match.group(1)) if match else None
+
+
+def _wait_for_oob_port_free(host_id, port):
+    """Wait until the worker's OOB port is available."""
+    deadline = time.time() + PORT_CLEAR_TIMEOUT_SEC
+    while _oob_port_has_listener(host_id, port):
+        if time.time() >= deadline:
+            raise RuntimeError(
+                "OOB port {} on {} is still in use before starting the "
+                "server -- orphaned listener from a previous test?".format(
+                    port, host_id))
+        sleep(OOB_POLL_INTERVAL_SEC)
+
+
+def _wait_for_server_listening(host_id, port, server_process,
+                               server_log_path=None):
+    """
+    Wait for the server's OOB listener before starting the client.
+
+    Include server output when the server exits or the wait times out.
+    Server stdout is redirected to server_log_path, so read output from
+    the log file rather than the process pipe.
+    """
+    def server_output():
+        if not server_log_path:
+            return "<no server log>"
+        try:
+            with open(server_log_path) as f:
+                return f.read()
+        except OSError as e:
+            return "<failed to read server log {}: {}>".format(
+                server_log_path, e)
+
+    deadline = time.time() + SERVER_LISTEN_TIMEOUT_SEC
+    while True:
+        if server_process.poll() is not None:
+            output = server_output()
+            if has_ssh_connection_err_msg(output):
+                raise SshConnectionError()
+            raise RuntimeError(
+                "Server exited (returncode {}) before listening on OOB port "
+                "{}. Server output:\n{}".format(
+                    server_process.returncode, port, output))
+        try:
+            if _oob_port_has_listener(host_id, port):
+                return
+        except SshConnectionError:
+            if time.time() >= deadline:
+                raise
+            print("SSH probe rejected; retrying")
+
+        if time.time() >= deadline:
+            raise RuntimeError(
+                "Server did not listen on OOB port {} on {} within {}s. "
+                "Server output:\n{}".format(
+                    port, host_id, SERVER_LISTEN_TIMEOUT_SEC,
+                    server_output()))
+        sleep(OOB_POLL_INTERVAL_SEC)
+
+
+class ClientServerTest:
+
+    def __init__(self, cmdline_args, executable,
+                 iteration_type=None,
+                 completion_semantic="transmit_complete",
+                 prefix_type="wout_prefix",
+                 datacheck_type="wout_datacheck",
+                 message_size=None,
+                 memory_type="host_to_host",
+                 timeout=None,
+                 warmup_iteration_type=None,
+                 completion_type="queue",
+                 fabric=None,
+                 additional_env='',
+                 might_fail=False):
+
+        self._cmdline_args = cmdline_args
+        self._timeout = timeout or cmdline_args.timeout
+        self._server_parameters = {}
+        self._client_parameters = {}
+        args = {k: v for k, v in locals().items() if k not in ['self', 'timeout', 'cmdline_args']}
+        for name, value in args.items():
+            if isinstance(value, dict) and {"server", "client"}.issubset(value):
+                self._server_parameters[name] = value["server"]
+                self._client_parameters[name] = value["client"]
+            else:
+                self._server_parameters[name] = value
+                self._client_parameters[name] = value
+
+        self._server_base_command, server_additonal_environment = self.prepare_base_command("server", **self._server_parameters)
+        self._client_base_command, client_additonal_environment = self.prepare_base_command("client", **self._client_parameters)
+
+        self._server_command = self._cmdline_args.populate_command(self._server_base_command, "server", self._timeout, server_additonal_environment)
+        self._client_command = self._cmdline_args.populate_command(self._client_base_command, "client", self._timeout, client_additonal_environment)
+
+    def prepare_base_command(self, command_type, executable,
+                             iteration_type=None,
+                             completion_semantic="transmit_complete",
+                             prefix_type="wout_prefix",
+                             datacheck_type="wout_datacheck",
+                             message_size=None,
+                             memory_type="host_to_host",
+                             warmup_iteration_type=None,
+                             completion_type="queue",
+                             fabric=None,
+                             additional_env='',
+                             might_fail=False):
+        if executable == "fi_ubertest":
+            return "fi_ubertest", additional_env
+
+        '''
+            all execuables in fabtests (except fi_ubertest) accept a common set of arguments:
+                -I: number of iteration
+                -U: delivery complete (transmit complete if not specified)
+                -k: force prefix mode (not force prefix mode if not specified)
+                -v: data verification (no data verification if not specified)
+                -S: message size
+                -w: number of warmup iterations
+                -f: fabric name to test
+            this function will construct a command with these options
+        '''
+
+        command = executable[:]
+        if iteration_type == "short":
+            command += " -I 5"
+        elif iteration_type == "standard":
+            if not (self._cmdline_args.core_list is None):
+                command += " --pin-core " + self._cmdline_args.core_list
+            pass
+        elif iteration_type is None:
+            pass
+        else:
+            command += " -I " + str(iteration_type)
+
+        if warmup_iteration_type:
+            command += " -w " + str(warmup_iteration_type)
+
+        if completion_semantic == "delivery_complete":
+            command += " -U"
+        else:
+            assert completion_semantic == "transmit_complete"
+
+        if fabric:
+            command += f" -f {fabric}"
+
+        # Most fabtests actually run as -t queue by default.
+        # However, not all fabtests binaries support -t option.
+        # Therefore, only add this option for tests
+        # that requests counter type explicitly.
+        if completion_type == "counter":
+            command += " -t counter"
+        else:
+            assert completion_type == "queue"
+
+        if datacheck_type == "with_datacheck":
+            command += " -v"
+        else:
+            if datacheck_type != "wout_datacheck":
+                print("datacheck_type: " + datacheck_type)
+            assert datacheck_type == "wout_datacheck"
+
+        if prefix_type == "with_prefix":
+            command += " -k"
+        else:
+            assert prefix_type == "wout_prefix"
+
+        if message_size:
+            command += " -S " + str(message_size)
+
+        # in communication test, client is sender, server is receiver
+        client_memory_type, server_memory_type = memory_type.split("_to_")
+        host_memory_type, host_ip = (server_memory_type, self._cmdline_args.server_id) if command_type == "server" else (
+            client_memory_type, self._cmdline_args.client_id)
+
+        if host_memory_type == "host":
+            return command, additional_env    # default addtional environment variable
+
+        assert host_memory_type in ["cuda", "neuron", "rocr"]
+
+        if not has_hmem_support(self._cmdline_args, host_ip):
+            pytest.skip("no hmem support")
+
+        num_hmem = num_hmem_devices(host_ip, host_memory_type)
+        if num_hmem == 0:
+                pytest.skip("no {} device".format(host_memory_type))
+
+        command += " -D " + host_memory_type
+
+        if self._cmdline_args.do_dmabuf_reg_for_hmem:
+            command += " -R"
+
+        if "PYTEST_XDIST_WORKER" in os.environ:
+            worker_id = int(os.environ["PYTEST_XDIST_WORKER"].replace("gw", ""))
+            hmem_device_id = worker_id % num_hmem
+        else:
+            hmem_device_id = 0
+
+        if host_memory_type in ["cuda", "rocr"]:
+            command += " -i {}".format(hmem_device_id)
+        else:
+            assert host_memory_type == "neuron"
+            num_cores = num_neuron_cores_on_device(host_ip, hmem_device_id)
+            if command_type == "server":
+                additional_env = f"{additional_env} NEURON_RT_VISIBLE_CORES={hmem_device_id * num_cores}"
+            else:
+                additional_env = f"{additional_env} NEURON_RT_VISIBLE_CORES={hmem_device_id * num_cores + 1}"
+            wait_until_neuron_device_available(host_ip, hmem_device_id)
+
+        if self._cmdline_args.provider == "efa":
+            import efa.efa_common
+            if host_memory_type == "cuda":
+                efa_device = efa.efa_common.get_efa_device_name_for_cuda_device(host_ip, hmem_device_id, num_hmem)
+            elif host_memory_type == "neuron":
+                efa_device = efa.efa_common.get_efa_device_name_for_neuron_core(host_ip, hmem_device_id)
+            else:
+                efa_device = efa.efa_common.get_efa_device_name_for_hmem_device(host_ip, hmem_device_id, num_hmem)
+            command += " -d {}-rdm".format(efa_device)
+
+        return command, additional_env
+
+    def _run_client_command(self, server_process, client_command, output_filename=None,
+                            run_client_asynchronously=False):
+
+        if not output_filename:
+            output_file = open(NamedTemporaryFile(prefix="client.out.").name, "w")
+        else:
+            output_file = open(output_filename, "w")
+
+        if server_process.poll():
+            output_file.write("")
+            output_file.close()
+            raise RuntimeError("Server has terminated")
+
+        print("")
+        print("client_command: " + client_command)
+
+        result = WaitableProcess(
+            Popen(
+                client_command,
+                stdout=output_file,
+                stderr=output_file,
+                shell=True,
+                universal_newlines=True,
+            ),
+            self._timeout + SERVER_RESTART_DELAY_MS/1000,
+            output_file,
+        )
+
+        if run_client_asynchronously:
+            return result
+
+        client_timed_out = False
+        try:
+            result.wait()
+        except TimeoutExpired:
+            client_timed_out = True
+
+        client_output = result.output
+        print("client_stdout:")
+        print(client_output)
+
+        if has_ssh_connection_err_msg(client_output):
+            print("client encountered ssh connection issue!")
+            raise SshConnectionError()
+
+        print(f"client returncode: {result.returncode}")
+
+        if client_timed_out:
+            raise RuntimeError("Client timed out")
+
+        return result
+
+    @retry(retry_on_exception=is_ssh_connection_error, stop_max_attempt_number=3, wait_fixed=SERVER_RESTART_DELAY_MS)
+    def run(self):
+        if self._cmdline_args.is_test_excluded(self._server_base_command):
+            pytest.skip("excluded")
+
+        if self._cmdline_args.is_test_excluded(self._client_base_command):
+            pytest.skip("excluded")
+
+        server_log_path, client_log_path = make_test_log_paths()
+        log_msg = "server log: {}\nclient log: {}".format(
+            server_log_path, client_log_path)
+
+        # Start server
+        print("")
+        print("server_command: " + self._server_command)
+        print(log_msg)
+
+        # Use port readiness for Linux xdist workers with explicit OOB ports.
+        oob_port = None
+        if "PYTEST_XDIST_WORKER" in os.environ:
+            oob_port = _oob_port_from_command(self._server_command)
+        use_oob_readiness = (oob_port is not None and
+                             _is_linux_host(self._cmdline_args.server_id))
+
+        if use_oob_readiness:
+            _wait_for_oob_port_free(self._cmdline_args.server_id, oob_port)
+
+        with open(server_log_path, "w") as server_log_file:
+            server_process = Popen(
+                shlex.split(self._server_command),
+                stdout=server_log_file,
+                stderr=subprocess.STDOUT,
+                universal_newlines=True,
+            )
+
+        # From this point on the spawned server must be cleaned up on every exit path.
+        try:
+            if use_oob_readiness:
+                _wait_for_server_listening(self._cmdline_args.server_id, oob_port,
+                                           server_process,
+                                           server_log_path=server_log_path)
+            else:
+                sleep(1)
+
+            client_returncode = -1
+            try:
+                # Start client
+                # Retry on SSH connection error until server timeout
+                client_returncode = retry(
+                    retry_on_exception=is_ssh_connection_error,
+                    stop_max_delay=self._timeout * 1000,  # Convert to milliseconds
+                    wait_fixed=CLIENT_RETRY_INTERVAL_MS,
+                )(self._run_client_command)(server_process, self._client_command, client_log_path).returncode
+            except Exception as e:
+                print("Client error: {}".format(e))
+                # Clean up server if client is terminated unexpectedly
+                server_process.terminate()
+
+            server_timed_out = False
+            try:
+                server_process.wait(
+                    timeout=self._timeout + SERVER_RESTART_DELAY_MS/1000)
+            except TimeoutExpired:
+                server_timed_out = True
+                server_process.terminate()
+                try:
+                    server_process.wait(timeout=SERVER_RESTART_DELAY_MS/1000)
+                except TimeoutExpired:
+                    server_process.kill()
+                    server_process.wait()
+
+            print("server_stdout:")
+            ssh_connection_error = False
+            output_ends_with_newline = True
+            with open(server_log_path, errors="replace") as server_log_file:
+                for line in server_log_file:
+                    print(line, end="")
+                    output_ends_with_newline = line.endswith("\n")
+                    if has_ssh_connection_err_msg(line):
+                        ssh_connection_error = True
+            if not output_ends_with_newline:
+                print("")
+
+            if ssh_connection_error:
+                print("encountered ssh connection issue!")
+                raise SshConnectionError()
+
+            print(f"server returncode: {server_process.returncode}")
+
+            if server_timed_out:
+                raise RuntimeError("Server timed out\n" + log_msg)
+
+            list_to_check_return_code = []
+            if not self._server_parameters['might_fail']:
+                list_to_check_return_code.append(server_process.returncode)
+            if not self._client_parameters['might_fail']:
+                list_to_check_return_code.append(client_returncode)
+
+            strict = self._cmdline_args.strict_fabtests_mode
+            has_failure = any(
+                check_returncode(returncode, strict)[0] == FAIL
+                for returncode in list_to_check_return_code)
+            if not has_failure:
+                remove_test_logs(server_log_path, client_log_path)
+
+            check_returncode_list(list_to_check_return_code, strict,
+                                  extra_fail_message=log_msg)
+        finally:
+            self._ensure_server_dead(server_process)
+
+    def _ensure_server_dead(self, server_process):
+        """Guarantee the spawned server is gone before the test returns."""
+        if server_process.poll() is not None:
+            return
+
+        server_process.terminate()
+        try:
+            server_process.wait(timeout=10)
+        except TimeoutExpired:
+            server_process.kill()
+            server_process.wait()
+
+
+class MultinodeTest(ClientServerTest):
+
+    def __init__(self, cmdline_args, server_base_command,
+                 client_base_command, client_hostname_list,
+                 run_client_asynchronously=True):
+        self._cmdline_args = cmdline_args
+        self.numclient = len(client_hostname_list)
+        self._timeout = self._cmdline_args.timeout
+
+        self._server_base_command = cmdline_args.populate_command(server_base_command, "server", self._timeout)
+        self._client_base_command_list = []
+        for client_hostname in client_hostname_list:
+            cmdline_args_copy = copy.copy(cmdline_args)
+            cmdline_args_copy.client_id = client_hostname
+            self._client_base_command_list.append(cmdline_args_copy.populate_command(client_base_command, "client", self._timeout))
+        self._run_client_asynchronously = run_client_asynchronously
+
+    @retry(retry_on_exception=is_ssh_connection_error, stop_max_attempt_number=3, wait_fixed=SERVER_RESTART_DELAY_MS)
+    def run(self):
+        if self._cmdline_args.is_test_excluded(self._server_base_command):
+            pytest.skip("excluded")
+
+        # _client_base_command_list is populated from the same client_base_command,
+        # so it should be safe to only check the first one.
+        if self._cmdline_args.is_test_excluded(self._client_base_command_list[0]):
+            pytest.skip("excluded")
+
+        server_outfile = NamedTemporaryFile(prefix="fabtests_server.out.").name
+
+        # start running
+        server_process = Popen(self._server_base_command + "> " + server_outfile + " 2>&1", shell=True)
+        sleep(1)
+
+        client_process_list = [None] * self.numclient
+        client_outfile_list = [None] * self.numclient
+        for i in range(self.numclient):
+            client_outfile_list[i] = NamedTemporaryFile(prefix="fabtests_client_{}.out.".format(i)).name
+            try:
+                # Start client
+                # Retry on SSH connection error until server timeout
+                client_process_list[i] = retry(
+                    retry_on_exception=is_ssh_connection_error,
+                    stop_max_delay=self._timeout * 1000,  # Convert to milliseconds
+                    wait_fixed=CLIENT_RETRY_INTERVAL_MS,
+                )(self._run_client_command)(server_process, self._client_base_command_list[i],
+                                            client_outfile_list[i],
+                                            self._run_client_asynchronously)
+            except Exception as e:
+                print("Client error: {}".format(e))
+                # Clean up server if client is terminated unexpectedly
+                server_process.terminate()
+
+        server_timed_out = False
+        try:
+            server_process.wait(timeout=self._timeout)
+        except TimeoutExpired:
+            server_process.terminate()
+            server_timed_out = True
+
+        if has_ssh_connection_err_msg(open(server_outfile).read()):
+            print("encountered ssh connection issue!")
+            raise SshConnectionError()
+
+        client_timed_out = False
+        # for syncrhonous clients, this is already
+        # handled in self._run_client_command
+        if self._run_client_asynchronously:
+            for i in range(self.numclient):
+                try:
+                    client_process_list[i].wait()
+                except TimeoutExpired:
+                    client_timed_out = True
+
+        print("")
+        print("server_command: " + self._server_base_command)
+        print("server_stdout:")
+        print(open(server_outfile).read())
+        os.unlink(server_outfile)
+
+        for i in range(self.numclient):
+            print("client_{}_command: ".format(i) + self._client_base_command_list[i])
+            print("client_{}_stdout:".format(i))
+            print(client_process_list[i].output)
+            os.unlink(client_outfile_list[i])
+
+        if server_timed_out:
+            raise RuntimeError("Server timed out")
+
+        if client_timed_out:
+            raise RuntimeError("Client timed out")
+
+        strict = self._cmdline_args.strict_fabtests_mode
+
+        returncode_list = [server_process.returncode]
+        for i in range(self.numclient):
+            returncode_list.append(client_process_list[i].returncode)
+
+        check_returncode_list(returncode_list, strict)
+
+
+# Message size lists for @pytest.mark.message_sizes decorator.
+# Generic (provider-agnostic) size selections live here so all providers can share them.
+PERF_SIZES = ["all"]
+PERF_PR_CI = ["l:16,4096,16384,131072,1048576"]
+RANGE_SIZES = ["r:0,4,64", "r:4048,4,4148", "r:8000,4,9000", "r:17000,4,18000", "r:0,4096,1048576"]
+INJECT_SIZES = ["r:0,4,64", "r:4048,4,4148", "r:8000,4,9000"]
+RMA_PINGPONG_SIZES = ["r:4048,4,4148", "r:8000,4,9000", "r:17000,4,18000"]
+MULTI_RECV_SIZES = ["1024", "8192"]
+
+
+def test_selected_by_marker(config, test_markers, name):
+    expr_str = config.getoption("markexpr") or ""
+    if not expr_str or name not in test_markers:
+        return False
+    try:
+        from _pytest.mark.expression import Expression
+        expr = Expression.compile(expr_str)
+    except Exception as e:
+        raise RuntimeError(
+            f"test_selected_by_marker failed to compile markexpr {expr_str!r}. "
+            f"This might mean pytest's private _pytest.mark.expression API "
+            f"has changed. Underlying error: {e}"
+        ) from e
+    # would the test still be selected if `name` were removed from its markers?
+    with_marker = expr.evaluate(lambda n: n in test_markers)
+    without_marker = expr.evaluate(lambda n: n in (test_markers - {name}))
+    # true only when `name` is the reason this test got selected
+    return with_marker and not without_marker
+
+
+def client_server_have_device(memory_token, server_id, client_id):
+    """
+    Return True if both client and server endpoints named in a memory-type
+    token have the hmem device that token requires.
+
+    Any SSH/detection failure propagates to the caller,
+    which falls back to including all candidate memory types.
+    """
+    client_memory_type, server_memory_type = memory_token.split("_to_")
+    for memory_type_name, ip in ((client_memory_type, client_id),
+                                 (server_memory_type, server_id)):
+        if memory_type_name == "host":
+            # host memory needs no accelerator device
+            continue
+        if num_hmem_devices(ip, memory_type_name) <= 0:
+            return False
+    return True
