@@ -1,0 +1,263 @@
+import groovy.transform.Field
+
+properties([disableConcurrentBuilds(abortPrevious: true)])
+@Field def DO_RUN=true
+@Field def RELEASE=false
+@Field def weekly=false
+@Field def CTARGET="main"
+
+def checkout_upstream() {
+  sh """
+    rm -rf ${env.CUSTOM_WORKSPACE}/upstream
+    mkdir -p ${env.CUSTOM_WORKSPACE}/upstream
+    git clone --branch ${CTARGET} ${env.UPSTREAM} ${env.CUSTOM_WORKSPACE}/upstream
+  """
+}
+
+def checkout_ci() {
+  sh """
+    rm -rf ${env.CUSTOM_WORKSPACE}/ci
+    mkdir ${env.CUSTOM_WORKSPACE}/ci
+    git clone --recurse-submodules ${env.CI} ${env.CUSTOM_WORKSPACE}/ci
+  """
+}
+
+def initialize() {
+  checkout_tar("source")
+  dir (CUSTOM_WORKSPACE) {
+    checkout_upstream()
+    checkout_ci()
+    sh "mkdir -p ${CUSTOM_WORKSPACE}/log_dir"
+    sh "${CI_LOCATION}/bootstrap.sh"
+  }
+}
+
+def run_red(config_name) {
+  return sh (
+    returnStatus: false,
+    script: """PATH=${CI_LOCATION}/venv/bin/:${env.PATH} red \
+               --output ${CUSTOM_WORKSPACE} \
+               --config "${CI_LOCATION}/red_configs/${config_name}.json" \
+               -v 2
+            """
+  )
+}
+
+def send_logs(cluster, key, dest, source) {
+  def address = "${env.USER}@${cluster}"
+  try {
+    sh "scp -r -i ${key} ${source}/* ${address}:${dest}/"
+  } catch (Exception e) {
+    echo "Caught exception ${e} when transfering files to ${cluster}"
+  }
+}
+
+def CI_summarize(verbose=false) {
+  def options = ""
+  if (verbose) {
+    options = "${options} -v"
+  }
+
+  if (weekly || RELEASE) {
+    options = "${options} --send-mail"
+  }
+
+  sh """source ${CI_LOCATION}/venv/bin/activate;\
+        python ${CI_LOCATION}/summarize.py \
+        --log_directory=${env.LOG_DIR} \
+        ${options}
+     """
+}
+
+def checkout_tar(name) {
+  weekly = env.WEEKLY != null ? env.WEEKLY.toBoolean() : false
+  def weekly_target = env.WEEKLY_TARGET != null ? env.WEEKLY_TARGET : "main"
+  def change_target = env.CHANGE_TARGET != null ? env.CHANGE_TARGET : "main"
+  CTARGET = weekly ? weekly_target : change_target
+  dir ("${env.CUSTOM_WORKSPACE}/${name}/libfabric") {
+    checkout scm
+    sh """
+      git remote add upstream ${env.UPSTREAM}
+      git pull --rebase upstream ${CTARGET}
+    """
+  }
+  dir ("${env.CUSTOM_WORKSPACE}/${name}/") {
+    sh "tar -cvf libfabric.tar.gz libfabric/*"
+  }
+}
+
+def git_diffs() {
+  dir ("${CUSTOM_WORKSPACE}/source/libfabric") {
+    sh "git diff --name-only HEAD..upstream/${CTARGET} > ./commit_id"
+    sh "git diff upstream/${CTARGET}:Makefile.am Makefile.am > ./Makefile.am.diff"
+    sh "git diff upstream/${CTARGET}:configure.ac configure.ac > ./configure.ac.diff"
+    sh "cat configure.ac | grep AC_INIT | cut -d ' ' -f 2 | cut -d '[' -f 2 | cut -d ']' -f 1 > ./release_num.txt"
+  }
+}
+
+def release() {
+  def file = "${CUSTOM_WORKSPACE}/source/libfabric/commit_id"
+  if (!fileExists(file)) {
+    echo "file ${file} does not exist"
+    echo "CI Run has not rebased with ofiwg/libfabric. Please Rebase."
+    return false
+  }
+
+  def changes = readFile file
+  def changeStrings = new ArrayList<String>()
+
+  for (line in changes.readLines()) {
+    changeStrings.add(line)
+  }
+
+  if ((changeStrings.toArray().any { it =~ /(Makefile\.am)\b/ }) &&
+      (changeStrings.toArray().any { it =~ /(configure\.ac)\b/ })) {
+        echo "This is probably a release"
+        return true
+  }
+
+  return false
+}
+
+def skip() {
+  def file = "${CUSTOM_WORKSPACE}/source/libfabric/commit_id"
+  if (!fileExists(file))
+    error("CI Run has not rebased with ofiwg/libfabric. Please Rebase.")
+
+  def changes = readFile file
+  def changeStrings = new ArrayList<String>()
+
+  for (line in changes.readLines()) {
+    changeStrings.add(line)
+  }
+
+  echo "Changeset is: ${changeStrings.toArray()}"
+  if (changeStrings.toArray().every { it =~ /(?:fabtests\/pytest|man|prov\/efa|prov\/opx|prov\/cxi|prov\/lpp|contrib\/aws|contrib\/cray|.github|.gitignore).*$/ }) {
+    echo "DONT RUN!"
+    return true
+  }
+
+  if (changeStrings.isEmpty()) {
+    echo "DONT RUN!"
+    return true
+  }
+
+  return false
+}
+
+pipeline {
+  agent {
+    node {
+      label 'cbj-main'
+      customWorkspace "workspace/${JOB_NAME}/${env.BUILD_NUMBER}"
+    }
+  }
+  options {
+      timestamps()
+      timeout(activity: true, time: 6, unit: 'HOURS')
+      skipDefaultCheckout()
+  }
+  environment {
+      JOB_CADENCE = 'PR'
+      CUSTOM_WORKSPACE="${CB_HOME}/workspace/${JOB_NAME}/${env.BUILD_NUMBER}"
+      SLURM_JOB_NAME="${env.JOB_NAME}_${env.BUILD_NUMBER}"
+      RUN_LOCATION="${env.CUSTOM_WORKSPACE}/ci_resources/legacy_pipeline_scripts/"
+      CI_LOCATION="${env.CUSTOM_WORKSPACE}/ci"
+      LOG_DIR = "${env.CUSTOM_WORKSPACE}/log_dir"
+      TARGET="main"
+  }
+  stages {
+    stage ('init') {
+      parallel {
+        stage ('main') {
+          steps {
+            script {
+              initialize()
+            }
+          }
+        }
+        stage ('level-zero') {
+          agent { node { label 'level-zero' } }
+          options { skipDefaultCheckout() }
+          steps {
+            script {
+              initialize()
+            }
+          }
+        }
+      }
+    }
+    stage ('opt_out') {
+      steps {
+        script {
+          git_diffs()
+          RELEASE = release()
+          DO_RUN = skip() && !weekly ? false : true
+          if (DO_RUN) {
+            sh """PATH=${CI_LOCATION}/venv/bin/:${env.PATH} \
+                  python ${CI_LOCATION}/authorize.py \
+                  --author=${env.CHANGE_AUTHOR}
+            """
+          }
+        }
+      }
+    }
+    stage ('run') {
+      when { equals expected: true, actual: DO_RUN }
+      parallel {
+        stage ('main') {
+          steps {
+            script {
+              withEnv(["TARGET=${CTARGET}"]) {
+                dir (CI_LOCATION) {
+                  return run_red("${env.MAIN_CONFIG}")
+                }
+              }
+            }
+          }
+        }
+        stage ('level-zero') {
+          agent { node { label 'level-zero' } }
+          options { skipDefaultCheckout() }
+          steps {
+            script {
+              withEnv(["TARGET=${CTARGET}"]) {
+                dir (CI_LOCATION) {
+                  def ret = run_red("${env.LEVEL_ZERO_CONFIG}")
+                  send_logs("${env.CBJ_ADDR}", "${env.CBJ_KEY}",
+                            "${env.LOG_DIR}", "${env.LOG_DIR}")
+                  return ret
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    stage ('Summary') {
+      when { equals expected: true, actual: DO_RUN }
+      steps {
+        script {
+          CI_summarize(verbose=false)
+        }
+      }
+    }
+  }
+
+  post {
+    always {
+      script {
+        if (DO_RUN) {
+          CI_summarize(verbose=true)
+          CI_summarize()
+        }
+      }
+      node ('level-zero') {
+        dir("${env.WORKSPACE}") { deleteDir() }
+        dir("${env.WORKSPACE}@tmp") { deleteDir() }
+      }
+      dir("${env.WORKSPACE}") { deleteDir() }
+      dir("${env.WORKSPACE}@tmp") { deleteDir() }
+    }
+  }
+}

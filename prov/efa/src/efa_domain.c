@@ -1,0 +1,847 @@
+/* SPDX-License-Identifier: BSD-2-Clause OR GPL-2.0-only */
+/* SPDX-FileCopyrightText: Copyright (c) 2013-2015 Intel Corporation, Inc.  All rights reserved. */
+/* SPDX-FileCopyrightText: Copyright Amazon.com, Inc. or its affiliates. All rights reserved. */
+
+#include <assert.h>
+#include <ofi_util.h>
+
+#include "config.h"
+#include "efa.h"
+#include "efa_abi.h"
+#include "efa_av.h"
+#include "efa_cntr.h"
+#include "efa_hw_cntr.h"
+#include "efa_cq.h"
+#include "efa_domain_util.h"
+
+
+struct dlist_entry g_efa_domain_list;
+
+static int efa_domain_close(fid_t fid);
+
+static int efa_domain_ops_open(struct fid *fid, const char *ops_name,
+				uint64_t flags, void **ops, void *context);
+
+static struct fi_ops efa_ops_domain_fid = {
+	.size = sizeof(struct fi_ops),
+	.close = efa_domain_close,
+	.bind = fi_no_bind,
+	.control = fi_no_control,
+	.ops_open = efa_domain_ops_open,
+};
+
+static struct fi_ops_domain efa_domain_ops = {
+	.size = sizeof(struct fi_ops_domain),
+	.av_open = efa_av_open,
+	.cq_open = efa_cq_open,
+	.endpoint = efa_ep_open,
+	.scalable_ep = fi_no_scalable_ep,
+	.cntr_open = efa_cntr_open,
+	.poll_open = fi_no_poll_open,
+	.stx_ctx = fi_no_stx_context,
+	.srx_ctx = fi_no_srx_context,
+	.query_atomic = fi_no_query_atomic,
+	.query_collective = fi_no_query_collective,
+};
+
+/**
+ * @brief init the device and ibv_pd field in efa_domain
+ *
+ * @param efa_domain[in,out]	efa domain to be set.
+ * @param domain_name		domain name
+ * @param ep_type		endpoint type
+ * @return 0 if efa_domain->device and efa_domain->ibv_pd has been set successfully
+ *         negative error code if err is encountered
+ */
+int efa_domain_init_device_and_pd(struct efa_domain *efa_domain,
+                                         const char *domain_name,
+                                         enum fi_ep_type ep_type)
+{
+	int i;
+	char *device_name = NULL;
+	const char *domain_name_suffix = efa_domain_name_suffix(ep_type);
+
+	if (!domain_name)
+		return -FI_EINVAL;
+
+	for (i = 0; i < g_efa_selected_device_cnt; i++) {
+		device_name = g_efa_selected_device_list[i].ibv_ctx->device->name;
+		if (strstr(domain_name, device_name) == domain_name &&
+		    strlen(domain_name) - strlen(device_name) ==
+		            strlen(domain_name_suffix) &&
+		    strcmp((const char *) (domain_name + strlen(device_name)),
+		           domain_name_suffix) == 0) {
+			efa_domain->device = &g_efa_selected_device_list[i];
+			ofi_atomic_inc32(&efa_domain->device->ref_cnt);
+			break;
+		}
+	}
+
+	if (i == g_efa_selected_device_cnt)
+		return -FI_ENODEV;
+
+	efa_domain->ibv_pd = ibv_alloc_pd(efa_domain->device->ibv_ctx);
+	if (!efa_domain->ibv_pd) {
+		EFA_WARN(FI_LOG_DOMAIN, "Failed to allocated ibv_pd: %d\n", errno);
+		return -FI_ENOMEM;
+	}
+
+	EFA_INFO(FI_LOG_DOMAIN, "Domain %s selected device %s\n", domain_name, device_name);
+	return 0;
+}
+
+/* @brief Allocate a zero byte bounce buf for efa-direct
+ *
+ * TODO: enable 0-byte bounce buffer usage on efa-RDM path
+ *
+ * @param efa_domain struct representing the domain to create the buffer for
+ * @param info info struct that was validated and returned by fi_getinfo
+ * @return 0 on success, fi_errno on error
+ */
+static int efa_domain_register_zero_byte_bounce_buf(struct efa_domain *efa_domain,
+						    struct fi_info *info)
+{
+	struct iovec iov;
+	struct fid_mr *mr_fid;
+	uint64_t mr_flags = FI_READ | FI_WRITE;
+	long page_size;
+	int ret;
+
+	if (efa_domain->info_type != EFA_INFO_DIRECT || !(info->caps & FI_RMA))
+		return 0;
+
+	page_size = ofi_get_page_size();
+	if (page_size <= 0) {
+		EFA_WARN(FI_LOG_DOMAIN, "Failed to get page size\n");
+		return -FI_EINVAL;
+	}
+
+	ret = ofi_memalign(&efa_domain->zero_byte_bounce_buf, page_size, page_size);
+	if (ret) {
+		EFA_WARN(FI_LOG_DOMAIN, "Failed to allocate zero-byte bounce buffer\n");
+		return ret;
+	}
+
+	iov.iov_base = efa_domain->zero_byte_bounce_buf;
+	iov.iov_len = page_size;
+	ret = fi_mr_regv(&efa_domain->util_domain.domain_fid,
+			 &iov, 1, mr_flags, 0, 0, 0, &mr_fid, NULL);
+	if (ret) {
+		EFA_WARN(FI_LOG_DOMAIN, "Failed to register zero-byte bounce buffer: %d\n", ret);
+		free(efa_domain->zero_byte_bounce_buf);
+		efa_domain->zero_byte_bounce_buf = NULL;
+		return ret;
+	}
+	efa_domain->zero_byte_bounce_buf_mr = container_of(mr_fid, struct efa_mr, mr_fid);
+	return 0;
+}
+
+/* @brief Allocate an efa-direct or dgram domain.
+ *
+ * This function creates a domain and uses the info struct to configure
+ * the domain based on what capabilities are set. Allocates the base
+ * struct efa_domain (no MR cache, no SHM, no RDM-specific bookkeeping).
+ * For DIRECT with FI_RMA capability, also registers the 0-byte rma
+ * bounce buffer. Fork support is checked here.
+ *
+ * @param fabric_fid fabric that the domain should be tied to
+ * @param info info struct that was validated and returned by fi_getinfo
+ * @param domain_fid pointer where newly domain fid should be stored
+ * @param context void pointer stored with the domain fid
+ * @return 0 on success, fi_errno on error
+ */
+int efa_domain_open(struct fid_fabric *fabric_fid, struct fi_info *info,
+		    struct fid_domain **domain_fid, void *context)
+{
+	struct efa_domain *efa_domain;
+	int ret = 0, err;
+
+	efa_domain = calloc(1, sizeof(struct efa_domain));
+	if (!efa_domain)
+		return -FI_ENOMEM;
+
+	if (info->ep_attr->type == FI_EP_RDM) {
+		efa_domain->info_type = EFA_INFO_DIRECT;
+	} else if (info->ep_attr->type == FI_EP_DGRAM) {
+		efa_domain->info_type = EFA_INFO_DGRAM;
+	} else {
+		EFA_WARN(FI_LOG_DOMAIN,
+			 "efa_domain_open called with non-direct/dgram info\n");
+		free(efa_domain);
+		*domain_fid = NULL;
+		return -FI_EINVAL;
+	}
+
+	err = efa_domain_init_base(efa_domain, fabric_fid, info, context);
+	if (err) {
+		ret = err;
+		goto err_free;
+	}
+
+	err = efa_mr_pool_create(efa_domain, sizeof(struct efa_mr));
+	if (err) {
+		ret = err;
+		goto err_free;
+	}
+
+	if (!efa_domain->mr_local) {
+		EFA_WARN(FI_LOG_EP_DATA, "EFA direct and dgram require FI_MR_LOCAL, but application does not support it\n");
+		ret = -FI_ENODATA;
+		goto err_free;
+	}
+
+	*domain_fid = &efa_domain->util_domain.domain_fid;
+
+	efa_domain->util_domain.domain_fid.fid.ops = &efa_ops_domain_fid;
+	efa_domain->util_domain.domain_fid.ops = &efa_domain_ops;
+	efa_domain->util_domain.domain_fid.mr = &efa_domain_mr_ops;
+
+	ret = efa_domain_register_zero_byte_bounce_buf(efa_domain, info);
+	if (ret)
+		goto err_free;
+
+	err = efa_domain_finalize_base(efa_domain);
+	if (err) {
+		ret = err;
+		goto err_free;
+	}
+
+	return 0;
+
+err_free:
+	assert(efa_domain);
+	err = efa_domain_close(&efa_domain->util_domain.domain_fid.fid);
+	if (err) {
+		EFA_WARN(FI_LOG_DOMAIN, "When handling error (%d), domain resource was being released. "
+			 "During the release process, an additional error (%d) was encountered\n",
+			 -ret, -err);
+	}
+	*domain_fid = NULL;
+
+	return ret;
+}
+
+static int efa_domain_close(fid_t fid)
+{
+	struct efa_domain *efa_domain;
+	int ret;
+
+	efa_domain = container_of(fid, struct efa_domain,
+				  util_domain.domain_fid.fid);
+
+	if (efa_domain->zero_byte_bounce_buf_mr) {
+		ret = fi_close(&efa_domain->zero_byte_bounce_buf_mr->mr_fid.fid);
+		if (ret)
+			EFA_WARN(FI_LOG_DOMAIN, "Failed to close zero-byte bounce buffer MR: %d\n", ret);
+		efa_domain->zero_byte_bounce_buf_mr = NULL;
+	}
+
+	if (efa_domain->zero_byte_bounce_buf) {
+		free(efa_domain->zero_byte_bounce_buf);
+		efa_domain->zero_byte_bounce_buf = NULL;
+	}
+
+	efa_domain_destruct(efa_domain);
+
+	free(efa_domain);
+	return 0;
+}
+
+/**
+ * @brief Query EFA specific Memory Region attributes
+ *
+ * @param mr ptr to fid_mr
+ * @param mr_attr  ptr to fi_efa_mr_attr
+ * @return int 0 on success, negative integer on failure
+ */
+#if HAVE_EFADV_QUERY_MR
+
+static int
+efa_domain_query_mr(struct fid_mr *mr_fid, struct fi_efa_mr_attr *mr_attr)
+{
+	struct efadv_mr_attr attr = {0};
+	struct efa_mr *efa_mr;
+	int ret;
+
+	memset(mr_attr, 0, sizeof(*mr_attr));
+
+	efa_mr = container_of(mr_fid, struct efa_mr, mr_fid);
+	ret = efadv_query_mr(efa_mr->ibv_mr, &attr, sizeof(attr));
+	if (ret) {
+		EFA_WARN(FI_LOG_DOMAIN, "efadv_query_mr failed. err: %d\n", ret);
+		return ret;
+	}
+
+	/* Translate the validity masks and bus_id from efadv_mr_attr to fi_efa_mr_attr */
+	if (attr.ic_id_validity & EFADV_MR_ATTR_VALIDITY_RECV_IC_ID) {
+		mr_attr->recv_ic_id = attr.recv_ic_id;
+		mr_attr->ic_id_validity |= FI_EFA_MR_ATTR_RECV_IC_ID;
+	}
+
+	if (attr.ic_id_validity & EFADV_MR_ATTR_VALIDITY_RDMA_READ_IC_ID) {
+		mr_attr->rdma_read_ic_id = attr.rdma_read_ic_id;
+		mr_attr->ic_id_validity |= FI_EFA_MR_ATTR_RDMA_READ_IC_ID;
+	}
+
+	if (attr.ic_id_validity & EFADV_MR_ATTR_VALIDITY_RDMA_RECV_IC_ID) {
+		mr_attr->rdma_recv_ic_id = attr.rdma_recv_ic_id;
+		mr_attr->ic_id_validity |= FI_EFA_MR_ATTR_RDMA_RECV_IC_ID;
+	}
+
+	return FI_SUCCESS;
+}
+
+#else
+
+static int
+efa_domain_query_mr(struct fid_mr *mr, struct fi_efa_mr_attr *mr_attr)
+{
+	return -FI_ENOSYS;
+}
+
+#endif /* HAVE_EFADV_QUERY_MR */
+
+/**
+ * @brief Query address information for a given endpoint and address.
+ *
+ * @param[in]  ep_fid Endpoint fid
+ * @param[in]  addr Destination address
+ * @param[out] ahn Pointer to store the address handle number
+ * @param[out] remote_qpn Pointer to store the remote QP number
+ * @param[out] remote_qkey Pointer to store the remote qkey
+ * @return 0 on success, negative integer on failure
+ */
+static int efa_domain_query_addr(struct fid_ep *ep_fid, fi_addr_t addr,
+				 uint16_t *ahn, uint16_t *remote_qpn,
+				 uint32_t *remote_qkey)
+{
+	struct efa_base_ep *base_ep = container_of(ep_fid, struct efa_base_ep, util_ep.ep_fid);
+	struct efa_av_entry *entry = efa_av_addr_to_entry(base_ep->av, addr);
+	if (!entry || !entry->ah) {
+		EFA_WARN(FI_LOG_EP_CTRL, "Failed to find connection for addr %lu\n", addr);
+		return -FI_EINVAL;
+	}
+	*ahn = entry->ah->ahn;
+	*remote_qpn = efa_av_entry_ep_addr(entry)->qpn;
+	*remote_qkey = efa_av_entry_ep_addr(entry)->qkey;
+
+	return FI_SUCCESS;
+}
+
+#if HAVE_EFADV_QUERY_QP_WQS
+/**
+ * @brief Query EFA specific Queue Pair work queue attributes
+ *
+ * The caller owns the structs and this op takes no length, so they are only as
+ * large as the fi_ext_efa.h the caller compiled against and the version it
+ * negotiated at fi_getinfo() is what says which members they have. Zero only
+ * as far as that version's struct reaches, and report a value only into a
+ * member it defines: caps arrived in 2.7.
+ *
+ * @param ep_fid  pointer to endpoint fid
+ * @param sq_attr pointer to send queue attributes
+ * @param rq_attr pointer to receive queue attributes
+ * @return 0 on success, negative integer on failure
+ */
+static int efa_domain_query_qp_wqs(struct fid_ep *ep_fid,
+				   struct fi_efa_wq_attr *sq_attr,
+				   struct fi_efa_wq_attr *rq_attr)
+{
+	struct efa_base_ep *base_ep;
+	struct efadv_wq_attr qp_sq_attr = {0};
+	struct efadv_wq_attr qp_rq_attr = {0};
+	uint32_t api_version;
+	bool has_caps_field;
+	size_t attr_size;
+	int ret;
+
+	base_ep = container_of(ep_fid, struct efa_base_ep, util_ep.ep_fid);
+	api_version =
+		base_ep->domain->util_domain.fabric->fabric_fid.api_version;
+	has_caps_field = FI_VERSION_GE(api_version, FI_VERSION(2, 7));
+	attr_size = efa_wq_attr_size(api_version);
+
+	memset(sq_attr, 0, attr_size);
+	memset(rq_attr, 0, attr_size);
+
+	ret = efadv_query_qp_wqs(base_ep->qp->ibv_qp, &qp_sq_attr, &qp_rq_attr, sizeof(qp_sq_attr));
+	if (ret) {
+		EFA_WARN(FI_LOG_DOMAIN, "efadv_query_qp_wqs failed. err: %d\n", ret);
+		return (ret == EOPNOTSUPP) ? -FI_EOPNOTSUPP : -FI_EINVAL;
+	}
+	if (OFI_UNLIKELY(qp_sq_attr.comp_mask)) {
+		EFA_WARN(FI_LOG_DOMAIN,
+			 "efadv_query_qp_wqs returned invalid sq comp_mask value: %lu\n",
+			 qp_sq_attr.comp_mask);
+		return -FI_EINVAL;
+	}
+	if (OFI_UNLIKELY(qp_rq_attr.comp_mask)) {
+		EFA_WARN(FI_LOG_DOMAIN,
+			 "efadv_query_qp_wqs returned invalid rq comp_mask value: %lu\n",
+			 qp_rq_attr.comp_mask);
+		return -FI_EINVAL;
+	}
+
+	sq_attr->buffer = qp_sq_attr.buffer;
+	sq_attr->entry_size = qp_sq_attr.entry_size;
+	sq_attr->num_entries = qp_sq_attr.num_entries;
+	sq_attr->doorbell = qp_sq_attr.doorbell;
+	sq_attr->max_batch = qp_sq_attr.max_batch;
+	if (has_caps_field) {
+		sq_attr->caps = 0;
+#if HAVE_EFADV_WQ_ATTR_CAPS
+		if (qp_sq_attr.caps & EFADV_WQ_CAPS_64_BIT_REQ_ID)
+			sq_attr->caps |= FI_EFA_WQ_CAPS_64_BIT_REQ_ID;
+#endif
+	}
+
+	rq_attr->buffer = qp_rq_attr.buffer;
+	rq_attr->entry_size = qp_rq_attr.entry_size;
+	rq_attr->num_entries = qp_rq_attr.num_entries;
+	rq_attr->doorbell = qp_rq_attr.doorbell;
+	rq_attr->max_batch = qp_rq_attr.max_batch;
+	if (has_caps_field)
+		rq_attr->caps = 0;
+
+	return FI_SUCCESS;
+}
+#else
+static int efa_domain_query_qp_wqs(struct fid_ep *ep_fid,
+				   struct fi_efa_wq_attr *sq_attr,
+				   struct fi_efa_wq_attr *rq_attr)
+{
+	return -FI_ENOSYS;
+}
+#endif /* HAVE_EFADV_QUERY_QP_WQS */
+
+
+#if HAVE_EFADV_QUERY_CQ
+/**
+ * @brief Query EFA specific Completion Queue attributes
+ *
+ * @param cq_fid pointer to completion queue fid
+ * @param cq_attr pointer to fi_efa_cq_attr
+ * @return 0 on success, negative integer on failure
+ */
+static int efa_domain_query_cq(struct fid_cq *cq_fid, struct fi_efa_cq_attr *cq_attr)
+{
+	struct efa_cq *efa_cq = container_of(cq_fid, struct efa_cq, util_cq.cq_fid);
+	struct efadv_cq_attr attr = {0};
+	int ret;
+
+	memset(cq_attr, 0, sizeof(*cq_attr));
+
+	ret = efadv_query_cq(ibv_cq_ex_to_cq(efa_cq->ibv_cq.ibv_cq_ex), &attr, sizeof(attr));
+	if (ret) {
+		EFA_WARN(FI_LOG_DOMAIN, "efadv_query_cq failed. err: %d\n", ret);
+		return (ret == EOPNOTSUPP) ? -FI_EOPNOTSUPP : -FI_EINVAL;
+	}
+	if (OFI_UNLIKELY(attr.comp_mask)) {
+		EFA_WARN(FI_LOG_DOMAIN,
+			 "efadv_query_cq returned invalid comp_mask value: "
+			 "%lu\n", attr.comp_mask);
+		return -FI_EINVAL;
+	}
+
+	cq_attr->buffer = attr.buffer;
+	cq_attr->entry_size = attr.entry_size;
+	cq_attr->num_entries = attr.num_entries;
+
+	return FI_SUCCESS;
+}
+#else
+static int efa_domain_query_cq(struct fid_cq *cq_fid, struct fi_efa_cq_attr *cq_attr)
+{
+	return -FI_ENOSYS;
+}
+#endif /* HAVE_EFADV_QUERY_CQ */
+
+
+#if HAVE_CAPS_CQ_WITH_EXT_MEM_DMABUF && HAVE_EFADV_CQ_EX
+static struct fi_ops_cq efa_cq_ext_ops = {
+	.size = sizeof(struct fi_ops_cq),
+	.read = fi_no_cq_read,
+	.readfrom = fi_no_cq_readfrom,
+	.readerr = fi_no_cq_readerr,
+	.sread = fi_no_cq_sread,
+	.sreadfrom = fi_no_cq_sreadfrom,
+	.signal = fi_no_cq_signal,
+	.strerror = efa_cq_strerror,
+};
+
+static void efa_cq_ext_progress_no_op(struct util_cq *cq)
+{
+	return;
+}
+
+// Avoid flushing cq when it is created with external memory
+static int efa_cq_ext_no_poll_ibv_cq(ssize_t cqe_to_process, struct efa_ibv_cq *ibv_cq)
+{
+	return ENOENT;
+}
+
+/**
+ * @brief Create a completion queue with external memory provided via dmabuf.
+ *
+ * @param domain_fid Open resource domain
+ * @param attr Completion queue attributes
+ * @param efa_cq_init_attr Structure containing attributes for creating cq on external memory
+ * @param cq_fid pointer to the created completion queue fid
+ * @param context User specified context associated with the completion queue.
+ * @return 0 on success, negative integer on failure
+ */
+static int efa_domain_cq_open_ext(struct fid_domain *domain_fid,
+				  struct fi_cq_attr *attr,
+				  struct fi_efa_cq_init_attr *efa_cq_init_attr,
+				  struct fid_cq **cq_fid, void *context)
+{
+	struct efa_cq *cq;
+	struct efa_domain *efa_domain;
+	int err, retv;
+
+	/* GPU cannot do a blocking wait on CQ entries because
+	 * system FDs are only accessible to CPU. */
+	if (attr->wait_obj != FI_WAIT_NONE)
+		return -FI_ENOSYS;
+
+	if (!(efa_cq_init_attr->flags & FI_EFA_CQ_INIT_FLAGS_EXT_MEM_DMABUF)) {
+		EFA_WARN(FI_LOG_DOMAIN, "FI_EFA_CQ_INIT_FLAGS_EXT_MEM_DMABUF flag is not set\n");
+		return -FI_EINVAL;
+	}
+
+	if (!efa_cq_init_attr->ext_mem_dmabuf.length) {
+		EFA_WARN(FI_LOG_DOMAIN, "struct ext_mem_dmabuf is invalid\n");
+		return -FI_EINVAL;
+	}
+
+	if (!efa_device_support_cq_with_ext_mem_dmabuf()) {
+		EFA_WARN(FI_LOG_DOMAIN, "External memory CQ requested but not supported by device\n");
+		return -FI_EOPNOTSUPP;
+	}
+
+	cq = calloc(1, sizeof(*cq));
+	if (!cq)
+		return -FI_ENOMEM;
+
+	/*
+	 * CQ polling is safe when CPU virtual address is provided in buffer.
+	 * Otherwise, the memory is on GPU and the use of CQ poll interfaces should be avoided.
+	 */
+	cq->poll_ibv_cq = efa_cq_init_attr->ext_mem_dmabuf.buffer ? efa_cq_poll_ibv_cq: efa_cq_ext_no_poll_ibv_cq;
+	err = ofi_cq_init(&efa_prov, domain_fid, attr, &cq->util_cq,
+			  efa_cq_init_attr->ext_mem_dmabuf.buffer ?
+				  &efa_cq_progress :
+				  &efa_cq_ext_progress_no_op,
+			  context);
+	if (err) {
+		EFA_WARN(FI_LOG_CQ, "Unable to create UTIL_CQ\n");
+		goto err_free_cq;
+	}
+
+	efa_domain = container_of(cq->util_cq.domain, struct efa_domain,
+				  util_domain);
+	err = efa_cq_open_ibv_cq(attr, efa_domain->device->ibv_ctx,
+				    &cq->ibv_cq,
+				    efa_cq_init_attr);
+	if (err) {
+		EFA_WARN(FI_LOG_CQ, "Unable to create extended CQ with external memory: %s\n", fi_strerror(err));
+		goto err_free_util_cq;
+	}
+
+	ofi_atomic_initialize32(&cq->nevents, 0);
+
+	*cq_fid = &cq->util_cq.cq_fid;
+	(*cq_fid)->fid.fclass = FI_CLASS_CQ;
+	(*cq_fid)->fid.context = context;
+	(*cq_fid)->fid.ops = &efa_cq_fi_ops;
+	(*cq_fid)->ops = efa_cq_init_attr->ext_mem_dmabuf.buffer ? &efa_cq_ops : &efa_cq_ext_ops;
+
+	return 0;
+
+err_free_util_cq:
+	retv = ofi_cq_cleanup(&cq->util_cq);
+	if (retv)
+		EFA_WARN(FI_LOG_CQ, "Unable to close util cq: %s\n",
+			 fi_strerror(-retv));
+err_free_cq:
+	free(cq);
+	return err;
+}
+#else
+static int efa_domain_cq_open_ext(struct fid_domain *domain_fid,
+				  struct fi_cq_attr *attr,
+				  struct fi_efa_cq_init_attr *efa_cq_init_attr,
+				  struct fid_cq **cq_fid, void *context)
+{
+	return -FI_ENOSYS;
+}
+#endif
+
+static uint64_t efa_domain_get_mr_lkey(struct fid_mr *mr)
+{
+	struct efa_mr *efa_mr;
+
+	efa_mr = container_of(mr, struct efa_mr, mr_fid);
+	if (!efa_mr->ibv_mr) {
+		EFA_WARN(FI_LOG_DOMAIN, "MR not registered\n");
+		return FI_KEY_NOTAVAIL;
+	}
+
+	return efa_mr->ibv_mr->lkey;
+}
+
+
+#if HAVE_EFADV_CREATE_COMP_CNTR
+
+static inline int efa_domain_fi_to_efadv_memory_location(
+	const struct fi_efa_memory_location *fi_mem,
+	struct efadv_memory_location *efadv_mem)
+{
+	switch (fi_mem->type) {
+	case FI_EFA_MEMORY_LOCATION_VA:
+		if (!fi_mem->ptr) {
+			EFA_WARN(FI_LOG_CNTR,
+				 "ptr is required for VA memory location\n");
+			return -FI_EINVAL;
+		}
+		break;
+	case FI_EFA_MEMORY_LOCATION_DMABUF:
+		break;
+	default:
+		EFA_WARN(FI_LOG_CNTR, "Unknown memory location type %u\n",
+			 fi_mem->type);
+		return -FI_EINVAL;
+	}
+
+	efadv_mem->ptr = fi_mem->ptr;
+	efadv_mem->dmabuf.offset = fi_mem->dmabuf.offset;
+	efadv_mem->dmabuf.fd = fi_mem->dmabuf.fd;
+	efadv_mem->type = fi_mem->type;
+	return FI_SUCCESS;
+}
+
+static int efa_domain_cntr_open_ext(struct fid_domain *domain,
+				       struct fi_cntr_attr *attr,
+				       struct fid_cntr **cntr_fid,
+				       void *context,
+				       struct fi_efa_comp_cntr_init_attr *fi_efa_attr)
+{
+	struct efadv_comp_cntr_init_attr efa_cc_attr = {0};
+	struct efa_cntr *cntr;
+	uint32_t flags;
+	int ret;
+
+	if (!efa_env.use_hw_cntr)
+		return -FI_EOPNOTSUPP;
+
+	if (!fi_efa_attr) {
+		EFA_WARN(FI_LOG_CNTR,
+			 "fi_efa_attr is required for cntr_open_ext, "
+			 "use fi_cntr_open when no external memory is passed.\n");
+		return -FI_EINVAL;
+	}
+
+	if (fi_efa_attr->comp_mask) {
+		EFA_WARN(FI_LOG_CNTR,
+			 "Unsupported comp_mask 0x%lx in fi_efa_comp_cntr_init_attr\n",
+			 fi_efa_attr->comp_mask);
+		return -FI_EINVAL;
+	}
+
+	flags = fi_efa_attr->flags;
+
+	if (flags & FI_EFA_COMP_CNTR_INIT_WITH_COMP_EXTERNAL_MEM) {
+		efa_cc_attr.flags |= EFADV_COMP_CNTR_INIT_WITH_COMP_EXTERNAL_MEM;
+		ret = efa_domain_fi_to_efadv_memory_location(
+			&fi_efa_attr->comp_cntr_ext_mem, &efa_cc_attr.comp_cntr_ext_mem);
+		if (ret)
+			return ret;
+	}
+
+	if (flags & FI_EFA_COMP_CNTR_INIT_WITH_ERR_EXTERNAL_MEM) {
+		efa_cc_attr.flags |= EFADV_COMP_CNTR_INIT_WITH_ERR_EXTERNAL_MEM;
+		ret = efa_domain_fi_to_efadv_memory_location(
+			&fi_efa_attr->err_cntr_ext_mem, &efa_cc_attr.err_cntr_ext_mem);
+		if (ret)
+			return ret;
+	}
+
+	cntr = calloc(1, sizeof(*cntr));
+	if (!cntr)
+		return -FI_ENOMEM;
+
+	ret = efa_hw_cntr_open(domain, attr, cntr, cntr_fid, context, &efa_cc_attr);
+	if (ret) {
+		free(cntr);
+		return ret;
+	}
+
+	if (flags & FI_EFA_COMP_CNTR_INIT_WITH_COMP_EXTERNAL_MEM) {
+		cntr->comp_use_device_mem =
+			fi_efa_attr->comp_cntr_ext_mem.type == FI_EFA_MEMORY_LOCATION_DMABUF &&
+			!fi_efa_attr->comp_cntr_ext_mem.ptr;
+	}
+
+	if (flags & FI_EFA_COMP_CNTR_INIT_WITH_ERR_EXTERNAL_MEM) {
+		cntr->err_use_device_mem =
+			fi_efa_attr->err_cntr_ext_mem.type == FI_EFA_MEMORY_LOCATION_DMABUF &&
+			!fi_efa_attr->err_cntr_ext_mem.ptr;
+	}
+
+	return FI_SUCCESS;
+}
+#else
+static int efa_domain_cntr_open_ext(struct fid_domain *domain,
+				       struct fi_cntr_attr *attr,
+				       struct fid_cntr **cntr_fid,
+				       void *context,
+				       struct fi_efa_comp_cntr_init_attr *fi_efa_attr)
+{
+	return -FI_ENOSYS;
+}
+#endif /* HAVE_EFADV_CREATE_COMP_CNTR */
+
+
+struct fi_efa_ops_domain efa_ops_domain = {
+	.query_mr = efa_domain_query_mr,
+};
+
+static struct fi_efa_ops_gda efa_ops_gda = {
+	.query_addr = efa_domain_query_addr,
+	.query_qp_wqs = efa_domain_query_qp_wqs,
+	.query_cq = efa_domain_query_cq,
+	.cq_open_ext = efa_domain_cq_open_ext,
+	.get_mr_lkey = efa_domain_get_mr_lkey,
+	.cntr_open_ext = efa_domain_cntr_open_ext,
+};
+
+/**
+ * @brief Modify attributes of an enabled endpoint
+ *
+ * Only the efa-direct path is supported. On efa-rdm the QKEY doubles as the
+ * connection ID that is embedded in every packet header and cached by peers,
+ * so it cannot be changed once the endpoint is enabled.
+ *
+ * The caller is responsible for serializing this call against data path
+ * operations and fi_close() on @p ep_fid. This function does not take the
+ * endpoint lock, so a concurrent fi_send()/fi_close() on the same endpoint is
+ * undefined behavior.
+ *
+ * @param[in]	ep_fid		Endpoint fid
+ * @param[in]	ep_attr		New attribute values
+ * @param[in]	attr_mask	Bitwise OR of the FI_EFA_EP_ATTR_* attributes to
+ *				modify
+ * @return 0 on success, negative FI error code on failure
+ */
+static int efa_domain_modify_ep(struct fid_ep *ep_fid,
+				struct fi_efa_ep_attr *ep_attr, uint64_t attr_mask)
+{
+	struct efa_base_ep *base_ep;
+	struct efa_domain *domain;
+	struct ibv_qp_attr ibv_attr = {0};
+	int ibv_mask = 0;
+	int ret;
+	uint32_t old_qkey;
+
+	if (!ep_fid || !ep_attr)
+		return -FI_EINVAL;
+
+	if (ep_fid->fid.fclass != FI_CLASS_EP) {
+		EFA_WARN(FI_LOG_DOMAIN, "fid is not an endpoint\n");
+		return -FI_EINVAL;
+	}
+
+	if (attr_mask & ~FI_EFA_EP_ATTR_SUPPORTED_FLAGS) {
+		EFA_WARN(FI_LOG_DOMAIN,
+			 "Unsupported attr_mask: %ld\n", attr_mask);
+		return -FI_EOPNOTSUPP;
+	}
+
+	if (!attr_mask)
+		return FI_SUCCESS;
+
+	base_ep = container_of(ep_fid, struct efa_base_ep, util_ep.ep_fid);
+	domain = base_ep->domain;
+
+	if (!base_ep->efa_qp_enabled || !base_ep->qp || !base_ep->qp->ibv_qp) {
+		EFA_WARN(FI_LOG_DOMAIN, "Endpoint is not enabled\n");
+		return -FI_EINVAL;
+	}
+
+	if (attr_mask & FI_EFA_EP_ATTR_QKEY) {
+		if (domain->info_type != EFA_INFO_DIRECT) {
+			EFA_WARN(FI_LOG_DOMAIN, "Only efa direct supports "
+						"FI_EFA_MODIFY_EP_OPS\n");
+			return -FI_EOPNOTSUPP;
+		}
+
+		if (ep_attr->qkey & EFA_QKEY_PRIVILEGED_MASK) {
+			EFA_WARN(FI_LOG_DOMAIN,
+				 "QKEY 0x%x is in the privileged range and "
+				 "cannot be used\n",
+				 ep_attr->qkey);
+			return -FI_EINVAL;
+		}
+
+		ibv_attr.qkey = ep_attr->qkey;
+		ibv_mask |= IBV_QP_QKEY;
+
+		ret = -ibv_modify_qp(base_ep->qp->ibv_qp, &ibv_attr, ibv_mask);
+		if (ret) {
+			EFA_WARN(FI_LOG_DOMAIN, "ibv_modify_qp failed: %d\n",
+				 ret);
+			return ret;
+		}
+
+		old_qkey = base_ep->qp->qkey;
+		base_ep->qp->qkey = ep_attr->qkey;
+		base_ep->src_addr.qkey = ep_attr->qkey;
+		EFA_INFO(FI_LOG_DOMAIN, "EP qkey updated: 0x%x -> 0x%x\n",
+			 old_qkey, ep_attr->qkey);
+	}
+
+	return FI_SUCCESS;
+}
+
+static struct fi_efa_ops_modify_ep efa_ops_modify_ep = {
+	.modify_ep = efa_domain_modify_ep,
+};
+
+static int
+efa_domain_ops_open(struct fid *fid, const char *ops_name, uint64_t flags,
+		     void **ops, void *context)
+{
+	int ret = FI_SUCCESS;
+	struct efa_domain *efa_domain;
+
+	if (strcmp(ops_name, FI_EFA_DOMAIN_OPS) == 0) {
+		*ops = &efa_ops_domain;
+		return ret;
+	}
+	if (strcmp(ops_name, FI_EFA_GDA_OPS) == 0) {
+		efa_domain = container_of(fid, struct efa_domain, util_domain.domain_fid.fid);
+		if (efa_domain->info_type != EFA_INFO_DIRECT) {
+			EFA_WARN(FI_LOG_DOMAIN, "Only efa direct supports FI_EFA_GDA_OPS\n");
+			return -FI_EOPNOTSUPP;
+		}
+
+		*ops = &efa_ops_gda;
+		return ret;
+	}
+	if (strcmp(ops_name, FI_EFA_MODIFY_EP_OPS) == 0) {
+		efa_domain = container_of(fid, struct efa_domain, util_domain.domain_fid.fid);
+		if (efa_domain->info_type != EFA_INFO_DIRECT) {
+			EFA_WARN(FI_LOG_DOMAIN, "Only efa direct supports FI_EFA_MODIFY_EP_OPS\n");
+			return -FI_EOPNOTSUPP;
+		}
+
+		*ops = &efa_ops_modify_ep;
+		return ret;
+	}
+
+	EFA_WARN(FI_LOG_DOMAIN, "Unknown ops name: %s\n", ops_name);
+	ret = -FI_EINVAL;
+
+	return ret;
+}
+

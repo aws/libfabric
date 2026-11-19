@@ -1,0 +1,540 @@
+/*
+ * Copyright (C) 2016 by Argonne National Laboratory.
+ * Copyright (C) 2021-2026 Cornelis Networks.
+ *
+ * This software is available to you under a choice of one of two
+ * licenses.  You may choose to be licensed under the terms of the GNU
+ * General Public License (GPL) Version 2, available from the file
+ * COPYING in the main directory of this source tree, or the
+ * BSD license below:
+ *
+ *     Redistribution and use in source and binary forms, with or
+ *     without modification, are permitted provided that the following
+ *     conditions are met:
+ *
+ *      - Redistributions of source code must retain the above
+ *        copyright notice, this list of conditions and the following
+ *        disclaimer.
+ *
+ *      - Redistributions in binary form must reproduce the above
+ *        copyright notice, this list of conditions and the following
+ *        disclaimer in the documentation and/or other materials
+ *        provided with the distribution.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
+ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+#ifndef _FI_PROV_OPX_DOMAIN_H_
+#define _FI_PROV_OPX_DOMAIN_H_
+
+#include <unistd.h>
+#include <stdint.h>
+#include <pthread.h>
+#include <stdlib.h>
+#include <string.h>
+#include <uuid/uuid.h>
+#include <uthash.h>
+
+#include "rdma/fi_domain.h"
+#include "ofi_atom.h"
+#include "ofi_util.h"
+
+#include "rdma/opx/fi_opx.h"
+#include "rdma/opx/fi_opx_timer.h"
+
+#include "rdma/opx/fi_opx_tid_domain.h"
+
+#include "rdma/opx/opx_hmem_domain.h"
+#include "rdma/opx/opx_hfisvc_keyset.h"
+
+#if HAVE_HFISVC
+#include <infiniband/hfi1dv.h>
+#include <infiniband/verbs.h>
+#include <infiniband/hfisvc_client.h>
+
+/*
+ * The CQ completion flag macro was renamed between rdma-core-internal
+ * versions. configure detects which name the installed hfisvc_client.h
+ * provides (HAVE_HFISVC_CLIENT_COMPLETION_FLAG_CQ). OPX code uses
+ * OPX_HFISVC_CMPL_CQ so it builds against either version.
+ */
+#if HAVE_HFISVC_CLIENT_COMPLETION_FLAG_CQ
+#define OPX_HFISVC_CMPL_CQ HFISVC_CLIENT_COMPLETION_FLAG_CQ
+#else
+#define OPX_HFISVC_CMPL_CQ HFI1_BULKSVC_CMPL_CQ
+#endif
+#endif
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+struct fi_opx_ep; /* forward declaration */
+struct fi_opx_mr;
+
+struct opx_tid_fabric;
+struct opx_hmem_fabric;
+
+#if HAVE_HFISVC
+struct fi_opx_hfisvc_ctx {
+	struct ibv_context *ctx;
+	opx_hfisvc_keyset_t access_key_set;
+	hfisvc_client_key_t client_key;
+	opx_lid_t	    lid;
+	int		    fd_verbs;
+};
+#endif
+
+struct fi_opx_fabric {
+	struct util_fabric util_fabric;
+
+	struct opx_tid_fabric *tid_fabric;
+#ifdef OPX_HMEM
+	struct opx_hmem_fabric *hmem_fabric;
+#endif
+};
+
+struct fi_opx_node {
+	volatile uint64_t ep_count;
+};
+
+#define OPX_JOB_KEY_STR_SIZE	33
+#define OPX_DEFAULT_JOB_KEY_STR "00112233445566778899aabbccddeeff"
+
+#define OPX_SDMA_BOUNCE_BUF_MIN	      (64)
+#define OPX_SDMA_BOUNCE_BUF_THRESHOLD FI_OPX_SDMA_MIN_PAYLOAD_BYTES_DEFAULT
+#define OPX_SDMA_BOUNCE_BUF_MAX	      FI_OPX_SDMA_MIN_PAYLOAD_BYTES_MAX
+
+struct fi_opx_domain {
+	struct fid_domain     domain_fid;
+	struct fi_opx_fabric *fabric;
+
+	enum fi_threading     threading;
+	enum fi_resource_mgmt resource_mgmt;
+	int		      mr_mode;
+	enum fi_progress      data_progress;
+
+	uuid_t unique_job_key;
+	char   unique_job_key_str[OPX_JOB_KEY_STR_SIZE];
+
+	/*
+	 * Per-node driver-version-check shm cache segment this process created as
+	 * the "winner", so it can be released via opx_shm_cache_unlink() at domain
+	 * teardown.  Empty on non-winners.  Sized to OPX_SHM_SEGMENT_NAME_MAX_LENGTH
+	 * (opx_shm.h, not included here).
+	 */
+	char drvchk_shm_name[512];
+
+	char *progress_affinity_str;
+
+	uint32_t rx_count;
+	uint32_t tx_count;
+	uint8_t	 ep_count;
+
+	uint64_t	  num_mr_keys;
+	struct fi_opx_mr *mr_hashmap;
+
+	struct opx_tid_domain *tid_domain;
+#ifdef OPX_HMEM
+	struct opx_hmem_domain *hmem_domain;
+#endif
+
+#if HAVE_HFISVC
+	struct {
+		struct fi_opx_hfisvc_ctx ctxs[OPX_MAX_TX_CONTEXTS];
+		int			 num_ctxs;
+		/**
+		 * @brief Command queue used by the domain for issuing commands to the
+		 * hfisvc where we are opening/closing hfisvc memory regions.
+		 */
+		hfisvc_client_command_queue_t mr_command_queue;
+
+		/**
+		 * @brief Completion queue used by the domain for handling completions from the
+		 * hfisvc where we are opening/closing hfisvc memory regions.
+		 */
+		hfisvc_client_completion_queue_t mr_completion_queue;
+		ofi_atomic64_t			 ref_cnt;
+		void				*libhfi1verbs;
+		int (*initialize)(struct ibv_context *ctx);
+		int (*finalize)(struct ibv_context *ctx);
+		int (*get_client_key)(struct ibv_context *ctx, hfisvc_client_key_t *key);
+		int (*command_queue_open)(hfisvc_client_command_queue_t *command_queue, struct ibv_context *ctx);
+		int (*command_queue_close)(hfisvc_client_command_queue_t *command_queue);
+		int (*completion_queue_open)(hfisvc_client_completion_queue_t *completion_queue,
+					     struct ibv_context		      *ctx);
+		int (*completion_queue_close)(hfisvc_client_completion_queue_t *completion_queue);
+		size_t (*cq_read)(hfisvc_client_completion_queue_t completion_queue, uint64_t flags,
+				  struct hfisvc_client_cq_entry *buf, size_t buf_size_bytes, size_t count);
+		int (*cmd_dma_access_once)(hfisvc_client_command_queue_t   command_queue,
+					   struct hfisvc_client_completion completion, uint64_t flags,
+					   uint32_t access_key, uint32_t len, hfisvc_client_mr_t mr, uint64_t offset);
+		int (*cmd_dma_access_once_va)(hfisvc_client_command_queue_t   command_queue,
+					      struct hfisvc_client_completion completion, uint64_t flags,
+					      uint32_t access_key, uint32_t len, void *vaddr);
+		int (*cmd_rdma_read)(hfisvc_client_command_queue_t   command_queue,
+				     struct hfisvc_client_completion completion, uint64_t flags, uint32_t lid,
+				     hfisvc_client_key_t client, uint32_t len, uint64_t imm_data, uint32_t access_key,
+				     uint64_t remote_offset, hfisvc_client_mr_t mr, uint64_t offset);
+		int (*cmd_rdma_read_va)(hfisvc_client_command_queue_t	command_queue,
+					struct hfisvc_client_completion completion, uint64_t flags, uint32_t lid,
+					hfisvc_client_key_t client, uint32_t len, uint64_t imm_data,
+					uint32_t access_key, uint64_t remote_offset, void *vaddr);
+		int (*cmd_rdma_write)(hfisvc_client_command_queue_t   command_queue,
+				      struct hfisvc_client_completion completion, uint64_t flags, uint32_t lid,
+				      hfisvc_client_key_t client, uint32_t len, uint64_t imm_data, uint32_t access_key,
+				      uint64_t remote_offset, hfisvc_client_mr_t mr, uint64_t offset);
+		int (*cmd_mr_open)(hfisvc_client_command_queue_t   command_queue,
+				   struct hfisvc_client_completion completion, uint64_t flags, uint32_t len,
+				   void *vaddr, struct hfisvc_client_hmem hmem);
+		int (*cmd_mr_close)(hfisvc_client_command_queue_t   command_queue,
+				    struct hfisvc_client_completion completion, uint64_t flags, hfisvc_client_mr_t mr);
+		int (*cmd_dma_access_enable)(hfisvc_client_command_queue_t   command_queue,
+					     struct hfisvc_client_completion completion, uint64_t flags,
+					     uint32_t access_key, uint32_t len, hfisvc_client_mr_t mr, uint64_t offset,
+					     struct hfisvc_client_completion notification);
+		int (*cmd_dma_access_disable)(hfisvc_client_command_queue_t   command_queue,
+					      struct hfisvc_client_completion completion, uint64_t flags,
+					      uint32_t access_key);
+		int (*doorbell)(struct ibv_context *ctx);
+	} hfisvc;
+#endif
+	uint8_t	       use_hfisvc;
+	uint8_t	       padding[7];
+	ofi_atomic64_t ref_cnt;
+
+	struct slist	    deferred_work_queue;
+	struct ofi_bufpool *deferred_work_pool;
+
+	/*
+	 * Per-domain HFI selection state. The first endpoint opened on this
+	 * domain populates this; subsequent endpoints reuse it instead of
+	 * re-running fi_opx_hfi1_context_open (which can pick a different
+	 * HFI/LID and violate the OPX single-HFI-per-node invariant).
+	 * opx_hfi_local_info is 4 cache lines, 64-byte aligned.
+	 */
+	struct opx_hfi_local_info hfi_local_info;
+
+	FI_OPX_DEBUG_COUNTERS_DECLARE_COUNTERS;
+};
+
+struct fi_opx_av {
+	/* == CACHE LINE 0 == */
+
+	struct fid_av	      av_fid; /* 32 bytes */
+	struct fi_opx_domain *domain;
+	void		     *map_addr;
+	ofi_atomic64_t	      ref_cnt;
+	uint32_t	      addr_count;
+	enum fi_av_type	      type;
+	/* == CACHE LINE 1 == */
+
+	struct fi_opx_ep   *ep_tx;
+	struct fi_opx_addr *table_addr; /* allocated buffer to free */
+	uint64_t	    rx_ctx_bits;
+	uint32_t	    table_count; /* table, not av, count */
+	uint32_t	    pad;	 /* explicit tail padding to 8-byte alignment (96 bytes) */
+};
+
+/**
+ * Keeps track of the state of the MR with regards to HFI service.
+ *
+ * Each state indicates the following:
+ *
+ * NOT_REGISTERED      : The MR has not been registered with HFI service at all.
+ * OPEN_DEFERRED	   : The MR has been created, but the registration with HFI service has been deferred.
+ * PENDING_OPEN        : A request to register this MR with HFI service has been submitted, and we're waiting
+ *                       for a completion from HFI service to let us know it's done.
+ * PENDING_KEY_ALLOC   : This MR is registered with HFI service, but does not yet have an access_key assigned
+ *                       and registered with HFI service.
+ * PENDING_KEY_ENABLE  : An access_key has been assigned to this MR, and a request to enable DMA access for
+ *                       the key has been submitted to HFI service, and we're waiting for a completion from
+ *                       HFI service to let us know it's done.
+ * OPENED              : This MR is registered with HFI service, and may be used for DMA operations in HFI service
+ *                       using its access_key.
+ * PENDING_OPEN_CLOSE  : The MR-open request is still pending after close was requested. The open completion
+ *                       supplies the MR handle, after which deferred close work submits the MR-close request.
+ * PENDING_KEY_ALLOC_CLOSE : Close was requested while access-key allocation was pending. No HFI service command
+ *                       is outstanding; deferred close work, not MR CQ polling, submits the MR-close request.
+ * PENDING_KEY_ENABLE_CLOSE : The persistent-access enable request is still pending after close was requested.
+ *                       The enable completion transitions to OPENED, after which deferred close work disables it.
+ * PENDING_KEY_DISABLE : A request to deregister the access_key associated with this MR has been submitted to
+ *                       HFI service, and we're waiting for a completion from HFI service to let us know it's done.
+ * PENDING_DEREGISTER  : The access_key has been successfully deregistered from HFI service and freed, and now
+ *                       we need to deregister the MR from HFI service.
+ * PENDING_CLOSE       : A request to deregister this MR with HFI service has been submitted, and we're waiting
+ *                       for a completion from HFI service to let us know it's done.
+ * CLOSED              : The MR has been fully deregisterd with HFI service, and may be closed/freed.
+ */
+enum opx_mr_hfisvc_state {
+	OPX_MR_HFISVC_STATE_NOT_REGISTERED	     = 0,
+	OPX_MR_HFISVC_STATE_OPEN_DEFERRED	     = (1 << 0),
+	OPX_MR_HFISVC_STATE_PENDING_OPEN	     = (1 << 1),
+	OPX_MR_HFISVC_STATE_PENDING_KEY_ALLOC	     = (1 << 2),
+	OPX_MR_HFISVC_STATE_PENDING_KEY_ENABLE	     = (1 << 3),
+	OPX_MR_HFISVC_STATE_OPENED		     = (1 << 4),
+	OPX_MR_HFISVC_STATE_PENDING_OPEN_CLOSE	     = (1 << 5),
+	OPX_MR_HFISVC_STATE_PENDING_KEY_ALLOC_CLOSE  = (1 << 6),
+	OPX_MR_HFISVC_STATE_PENDING_KEY_ENABLE_CLOSE = (1 << 7),
+	OPX_MR_HFISVC_STATE_PENDING_KEY_DISABLE	     = (1 << 8),
+	OPX_MR_HFISVC_STATE_PENDING_DEREGISTER	     = (1 << 9),
+	OPX_MR_HFISVC_STATE_PENDING_CLOSE	     = (1 << 10),
+	OPX_MR_HFISVC_STATE_CLOSED		     = (1 << 11)
+};
+/*
+ * Who owns opx_mr->dmabuf.fd, and therefore how it must be released.
+ *
+ * BORROWED   : the caller's fd. OPX must not release it, and must not retain it
+ *              past registration - the caller may close it at any point.
+ * EXPORTED   : obtained from ofi_hmem_get_dmabuf_fd(). Released by
+ *              ofi_hmem_put_dmabuf_fd(), which closes the descriptor itself.
+ * DUPLICATED : a private copy of a caller fd. Released by close().
+ */
+/* Must be negative: fd 0 is legal. */
+#define OPX_SDMA_NO_DMABUF_FD (-1)
+
+enum opx_mr_dmabuf_owner { OPX_MR_DMABUF_BORROWED = 0, OPX_MR_DMABUF_EXPORTED, OPX_MR_DMABUF_DUPLICATED };
+
+#define OPX_MR_HFISVC_STATE_CLOSE_SHIFT 4
+OPX_COMPILE_TIME_ASSERT((OPX_MR_HFISVC_STATE_PENDING_OPEN << OPX_MR_HFISVC_STATE_CLOSE_SHIFT) ==
+				OPX_MR_HFISVC_STATE_PENDING_OPEN_CLOSE,
+			"Pending-open close state should be derived from pending-open state");
+OPX_COMPILE_TIME_ASSERT((OPX_MR_HFISVC_STATE_PENDING_KEY_ALLOC << OPX_MR_HFISVC_STATE_CLOSE_SHIFT) ==
+				OPX_MR_HFISVC_STATE_PENDING_KEY_ALLOC_CLOSE,
+			"Pending-key-alloc close state should be derived from pending-key-alloc state");
+OPX_COMPILE_TIME_ASSERT((OPX_MR_HFISVC_STATE_PENDING_KEY_ENABLE << OPX_MR_HFISVC_STATE_CLOSE_SHIFT) ==
+				OPX_MR_HFISVC_STATE_PENDING_KEY_ENABLE_CLOSE,
+			"Pending-key-enable close state should be derived from pending-key-enable state");
+
+struct fi_opx_mr {
+	/* == CACHE LINE 0-2 == */
+	struct fid_mr	      mr_fid; // 40 bytes
+	struct fi_mr_attr     attr;   // 112 bytes
+	struct fi_opx_domain *domain;
+	void		     *base_addr;
+	uint64_t	      flags;
+	uint64_t	      cntr_bflags;
+	struct fi_opx_cntr   *cntr;
+
+	/* == CACHE LINE 3 == */
+	union {
+		struct {
+			int	 dmabuf_fd;
+			uint32_t reserved_dw;
+			uint64_t reserved_qw[3];
+		};
+		struct {
+			uint32_t     reserved_fd;
+			uint32_t     unused_pad[3];
+			struct iovec iov;
+		};
+		struct fi_mr_dmabuf dmabuf;
+	};
+	struct {
+		union {
+			uint32_t reserved;
+#if HAVE_HFISVC
+			hfisvc_client_mr_t mr_handle;
+#endif
+		};
+		enum opx_mr_hfisvc_state state;
+		uint32_t		 access_key;
+		uint32_t		 padding;
+	} hfisvc;
+	uint8_t		     hmem_unified;
+	uint8_t		     dmabuf_owner; /* enum opx_mr_dmabuf_owner */
+	uint8_t		     in_hashmap;   /* 1 once linked into domain->mr_hashmap */
+	uint8_t		     unused[5];
+	struct ofi_mr_entry *cache_entry;
+
+	/* == CACHE LINE 4 == */
+	UT_hash_handle hh; // 56 bytes
+	uint64_t       unused_cacheline4_qw;
+} __attribute__((__aligned__(FI_OPX_CACHE_LINE_SIZE))) __attribute__((__packed__));
+OPX_COMPILE_TIME_ASSERT(sizeof(struct fi_opx_mr) == (FI_OPX_CACHE_LINE_SIZE * 5),
+			"Size of fi_opx_mr should be 5 cachelines!");
+OPX_COMPILE_TIME_ASSERT(offsetof(struct fi_opx_mr, dmabuf_fd) == (FI_OPX_CACHE_LINE_SIZE * 3),
+			"Offset of fi_opx_mr->dmabuf_fd should start at cacheline 3!");
+OPX_COMPILE_TIME_ASSERT(offsetof(struct fi_opx_mr, dmabuf_fd) == offsetof(struct fi_opx_mr, dmabuf.fd),
+			"Offset of fi_opx_mr->dmabuf_fd should start at the same point as fi_opx_mr->dmabuf.fd!");
+OPX_COMPILE_TIME_ASSERT(offsetof(struct fi_opx_mr, hh) == (FI_OPX_CACHE_LINE_SIZE * 4),
+			"Offset of fi_opx_mr->hh should start at cacheline 4!");
+
+static inline uint64_t opx_mr_dmabuf_local_offset(const struct fi_opx_mr *opx_mr, const void *buf)
+{
+	assert((uintptr_t) (buf) >= (uintptr_t) (opx_mr->dmabuf.base_addr));
+	return (uint64_t) ((uintptr_t) buf - (uintptr_t) opx_mr->dmabuf.base_addr);
+}
+
+struct opx_domain_deferred_work {
+	union {
+		struct slist_entry		 slist_entry;
+		struct opx_domain_deferred_work *next;
+	};
+	int (*work_fn)(struct opx_domain_deferred_work *work);
+	struct fi_opx_mr *opx_mr;
+	uint64_t	  unused;
+} __attribute__((__aligned__(32))) __attribute__((__packed__));
+
+#define FI_OPX_DEFAULT_DOMAIN_CTX_CNT 160
+
+uint32_t opx_domain_get_ctx_cnt(int hfi, int port);
+void	 opx_query_local_rank_info(int32_t *local_rank_count, int32_t *local_rank);
+
+/* Sum of opx_domain_get_ctx_cnt() across every active HFI unit on the node.
+ * Used to decide whether the number of local ranks exceeds the total number
+ * of contexts the node's HFIs can provide, so context sharing can be enabled
+ * automatically instead of requiring FI_OPX_CONTEXT_SHARING to be set. */
+uint32_t opx_domain_get_total_ctx_cnt(int port);
+
+static inline uint32_t fi_opx_domain_get_tx_max(struct fid_domain *domain)
+{
+	return opx_domain_get_ctx_cnt(0, 0);
+}
+
+static inline uint32_t fi_opx_domain_get_rx_max(struct fid_domain *domain)
+{
+	return opx_domain_get_ctx_cnt(0, 0);
+}
+
+int opx_hfisvc_mr_deferred_open(struct opx_domain_deferred_work *work);
+int opx_hfisvc_mr_deferred_close(struct opx_domain_deferred_work *work);
+
+/*
+ * Release opx_mr->dmabuf.fd according to its owner. Must be called from every
+ * path that reaches the final free of an opx_mr, including rollback paths.
+ * Idempotent.
+ */
+__OPX_FORCE_INLINE__
+void opx_mr_release_dmabuf_fd(struct fi_opx_mr *opx_mr)
+{
+	if (opx_mr->dmabuf.fd == OPX_SDMA_NO_DMABUF_FD) {
+		return;
+	}
+
+	switch (opx_mr->dmabuf_owner) {
+	case OPX_MR_DMABUF_EXPORTED:
+		/* Closes the descriptor itself. */
+		ofi_hmem_put_dmabuf_fd(opx_mr->attr.iface, opx_mr->dmabuf.fd);
+		break;
+	case OPX_MR_DMABUF_DUPLICATED:
+		close(opx_mr->dmabuf.fd);
+		break;
+	case OPX_MR_DMABUF_BORROWED:
+	default:
+		break;
+	}
+
+	opx_mr->dmabuf.fd    = OPX_SDMA_NO_DMABUF_FD;
+	opx_mr->dmabuf_owner = OPX_MR_DMABUF_BORROWED;
+}
+
+#if HAVE_HFISVC
+int opx_hfisvc_mr_lazy_open(struct fi_opx_domain *opx_domain, struct fi_opx_mr *opx_mr);
+
+__OPX_FORCE_INLINE__
+void opx_hfisvc_mr_lazy_open_if_deferred(struct fi_opx_domain *opx_domain, struct fi_opx_mr *opx_mr)
+{
+	if (opx_mr && opx_mr->hfisvc.state == OPX_MR_HFISVC_STATE_OPEN_DEFERRED) {
+		opx_hfisvc_mr_lazy_open(opx_domain, opx_mr);
+	}
+}
+#else
+__OPX_FORCE_INLINE__
+void opx_hfisvc_mr_lazy_open_if_deferred(struct fi_opx_domain *opx_domain, struct fi_opx_mr *opx_mr)
+{
+	(void) opx_domain;
+	(void) opx_mr;
+}
+#endif
+
+#if HAVE_HFISVC
+__OPX_FORCE_INLINE__
+int opx_domain_deferred_work_enqueue(struct fi_opx_domain *opx_domain, struct fi_opx_mr *opx_mr,
+				     int (*work_fn)(struct opx_domain_deferred_work *work))
+{
+	struct opx_domain_deferred_work *work = ofi_buf_alloc(opx_domain->deferred_work_pool);
+	if (OFI_UNLIKELY(work == NULL)) {
+		FI_WARN(fi_opx_global.prov, FI_LOG_DOMAIN, "Error allocating deferred work for hfisvc mr open\n");
+		return -FI_ENOMEM;
+	}
+	work->next    = NULL;
+	work->opx_mr  = opx_mr;
+	work->work_fn = work_fn;
+
+	int ret = work_fn(work);
+	if (OFI_UNLIKELY(ret == FI_SUCCESS)) {
+		OPX_BUF_FREE(work);
+	} else {
+		slist_insert_tail((struct slist_entry *) work, &opx_domain->deferred_work_queue);
+	}
+
+	return FI_SUCCESS;
+}
+
+__OPX_FORCE_INLINE__
+int opx_domain_deferred_work_enqueue_open(struct fi_opx_domain *opx_domain, struct fi_opx_mr *opx_mr)
+{
+	return opx_domain_deferred_work_enqueue(opx_domain, opx_mr, opx_hfisvc_mr_deferred_open);
+}
+
+__OPX_FORCE_INLINE__
+int opx_domain_deferred_work_enqueue_close(struct fi_opx_domain *opx_domain, struct fi_opx_mr *opx_mr)
+{
+	return opx_domain_deferred_work_enqueue(opx_domain, opx_mr, opx_hfisvc_mr_deferred_close);
+}
+
+static inline bool opx_mr_hfisvc_needs_close(const struct fi_opx_mr *opx_mr)
+{
+	assert(opx_mr != NULL);
+	return (opx_mr->hfisvc.state & (OPX_MR_HFISVC_STATE_PENDING_OPEN | OPX_MR_HFISVC_STATE_PENDING_KEY_ALLOC |
+					OPX_MR_HFISVC_STATE_PENDING_KEY_ENABLE | OPX_MR_HFISVC_STATE_OPENED));
+}
+
+static inline bool opx_mr_hfisvc_close_in_progress(const struct fi_opx_mr *opx_mr)
+{
+	assert(opx_mr != NULL);
+	return (opx_mr->hfisvc.state &
+		(OPX_MR_HFISVC_STATE_PENDING_OPEN_CLOSE | OPX_MR_HFISVC_STATE_PENDING_KEY_ALLOC_CLOSE |
+		 OPX_MR_HFISVC_STATE_PENDING_KEY_ENABLE_CLOSE | OPX_MR_HFISVC_STATE_PENDING_KEY_DISABLE |
+		 OPX_MR_HFISVC_STATE_PENDING_DEREGISTER | OPX_MR_HFISVC_STATE_PENDING_CLOSE));
+}
+
+__OPX_FORCE_INLINE__
+void opx_domain_deferred_work_do(struct fi_opx_domain *opx_domain)
+{
+	struct opx_domain_deferred_work *prev_item = NULL;
+	struct opx_domain_deferred_work *work_item =
+		(struct opx_domain_deferred_work *) opx_domain->deferred_work_queue.head;
+
+	while (work_item) {
+		int ret = (work_item->work_fn)(work_item);
+
+		if (ret == FI_SUCCESS) {
+			struct opx_domain_deferred_work *next_item = work_item->next;
+			slist_remove(&opx_domain->deferred_work_queue, (struct slist_entry *) work_item,
+				     (struct slist_entry *) prev_item);
+			OPX_BUF_FREE(work_item);
+			work_item = next_item;
+		} else {
+			prev_item = work_item;
+			work_item = work_item->next;
+		}
+	}
+}
+
+int opx_domain_hfisvc_init(struct fi_opx_domain *domain);
+int opx_domain_hfisvc_init_ctx(struct fi_opx_domain *domain, int ctx_index);
+#endif
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* _FI_PROV_OPX_DOMAIN_H_ */
