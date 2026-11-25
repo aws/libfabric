@@ -125,6 +125,30 @@ jobs:
           fi
         done <<< "${RELEASE_TAGS}"
 
+    - name: Check upstream workflow history
+      working-directory: source
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        REPO: ${{ github.repository }}
+        UPSTREAM_SHA: ${{ steps.upstream.outputs.upstream_sha }}
+      run: |
+        set -euo pipefail
+        # Only branches and tags in the destination count as already published.
+        REMOTE="https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
+        git fetch --quiet --no-tags --prune "${REMOTE}" \
+          'refs/heads/*:refs/release-destination/heads/*' \
+          'refs/tags/*:refs/release-destination/tags/*'
+
+        # Walk every new commit, including side branches and reverted changes.
+        WORKFLOW_COMMITS=$(git rev-list "${UPSTREAM_SHA}" --not --glob='refs/release-destination/*' | \
+          git diff-tree --stdin --root -r --diff-merges=first-parent --no-patch --format=%H -- .github/workflows)
+        if [ -n "${WORKFLOW_COMMITS}" ]; then
+          BRANCH=$(git branch --show-current)
+          echo "::error title=Upstream workflow changes need a cache refresh::Manually refresh upstream-cache/${BRANCH:-<branch>} in ${REPO} to include ${UPSTREAM_SHA}, then rerun this workflow."
+          printf 'Upstream commits that change .github/workflows:\n%s\n' "${WORKFLOW_COMMITS}"
+          exit 1
+        fi
+
     - name: Check release version suggestion
       id: version
       env:
@@ -185,39 +209,16 @@ jobs:
           exit 1
         fi
 
-    - name: Create sanitized release commit
+    - name: Create release commit
       id: release_commit
       env:
         RELEASE_VERSION: ${{ steps.version.outputs.version }}
       run: |
         cd source
-
         git config user.name "github-actions[bot]"
         git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-        # GitHub's GITHUB_TOKEN cannot push commits that introduce upstream
-        # workflow files. Build a root snapshot so workflow changes are absent
-        # from both the release tree and its ancestry.
-        SNAPSHOT_INDEX="${RUNNER_TEMP}/release-index-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-        trap 'rm -f "${SNAPSHOT_INDEX}"' EXIT
-        GIT_INDEX_FILE="${SNAPSHOT_INDEX}" git read-tree HEAD
-        GIT_INDEX_FILE="${SNAPSHOT_INDEX}" git rm -r --cached --ignore-unmatch .github/workflows
-
-        GIT_INDEX_FILE="${SNAPSHOT_INDEX}" git add configure.ac
-
-        SNAPSHOT_TREE=$(GIT_INDEX_FILE="${SNAPSHOT_INDEX}" git write-tree)
-        RELEASE_COMMIT=$(printf 'v%s\n' "${RELEASE_VERSION}" | git commit-tree "${SNAPSHOT_TREE}")
-        git checkout --force --detach "${RELEASE_COMMIT}"
-
-        if git ls-tree -r --name-only HEAD -- .github/workflows | grep -q .; then
-          echo "::error title=Release sanitization failed::Release commit contains files under .github/workflows"
-          exit 1
-        fi
-        if git rev-parse HEAD^ >/dev/null 2>&1; then
-          echo "::error title=Release sanitization failed::Release commit unexpectedly has a parent"
-          exit 1
-        fi
-
+        git commit -m "v${RELEASE_VERSION}" -- configure.ac
+        RELEASE_COMMIT=$(git rev-parse HEAD)
         echo "sha=${RELEASE_COMMIT}" >> "$GITHUB_OUTPUT"
 
     - name: Check version reservation
